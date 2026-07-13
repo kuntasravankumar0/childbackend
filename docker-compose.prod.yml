@@ -1,0 +1,81 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mdm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mdmdb}
+      POSTGRES_USER: ${POSTGRES_USER:-mdmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ChangeMe123!}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mdmuser} -d ${POSTGRES_DB:-mdmdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mdm-net
+
+  backend:
+    build: .
+    container_name: mdm-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-mdmdb}
+      POSTGRES_USER: ${POSTGRES_USER:-mdmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ChangeMe123!}
+      MDM_FILES_DIR: /opt/mdm/files
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      JWT_SECRET: ${JWT_SECRET:-MDMSecretKeyChangeThisInProduction32Chars}
+    volumes:
+      - mdmfiles:/opt/mdm/files
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    networks:
+      - mdm-net
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: mdm-mqtt
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mqttdata:/mosquitto/data
+    networks:
+      - mdm-net
+
+  # React web app served via nginx
+  frontend:
+    image: nginx:alpine
+    container_name: mdm-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - frontend_dist:/usr/share/nginx/html
+    depends_on:
+      - backend
+    networks:
+      - mdm-net
+
+volumes:
+  pgdata:
+  mdmfiles:
+  mqttdata:
+  frontend_dist:
+
+networks:
+  mdm-net:
+    driver: bridge

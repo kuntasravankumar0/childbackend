@@ -1,0 +1,35 @@
+version: '3.9'
+
+# ============================================================
+#  MDM Full Stack — docker-compose.yml
+#  Usage:  docker compose --env-file .env up --build
+# ============================================================
+
+services:
+
+  # ── Spring Boot Backend ──────────────────────────────────────
+  backend:
+    build: .
+    container_name: mdm-backend
+    env_file:
+      - .env
+    environment:
+      # These override/supplement .env for any Docker-specific values
+      MDM_FILES_DIR: /opt/mdm/files
+    volumes:
+      - mdmfiles:/opt/mdm/files
+    ports:
+      - "8080:8080"
+
+  # ── MQTT Broker (optional — only needed if using mqttWorker push) ──
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: mdm-mqtt
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+    restart: unless-stopped
+
+volumes:
+  mdmfiles:

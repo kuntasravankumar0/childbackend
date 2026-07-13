@@ -1,0 +1,11 @@
+-- ============================================================
+-- V2: Device Applications & Messaging
+-- ============================================================
+-- All schema changes are already included in V1.
+-- This is a reserved placeholder to maintain Flyway migration
+-- ordering and prevent FileNotFoundException errors.
+-- No changes needed as V1 contains the complete schema.
+-- ============================================================
+
+-- No-op: V1 already contains all tables including:
+--   device_applications, push_messages, device_logs, device_locations

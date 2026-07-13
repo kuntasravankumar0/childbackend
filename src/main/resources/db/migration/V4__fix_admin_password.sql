@@ -1,0 +1,12 @@
+-- ============================================================
+-- V4: Fix Admin Password
+-- ============================================================
+-- The admin password fix is already handled programmatically
+-- by DataInitializer.java which resets Sravan/Sravan@123 on
+-- every application startup.
+-- This is a reserved placeholder to maintain Flyway migration
+-- ordering and prevent FileNotFoundException errors.
+-- ============================================================
+
+-- No-op: Admin password management is handled by
+-- DataInitializer CommandLineRunner in Java code.

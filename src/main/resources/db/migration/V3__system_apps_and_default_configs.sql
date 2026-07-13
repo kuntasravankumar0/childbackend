@@ -1,0 +1,14 @@
+-- ============================================================
+-- V3: System Apps & Default Configurations
+-- ============================================================
+-- All seed data for system applications and default configurations
+-- is already included in V1.
+-- This is a reserved placeholder to maintain Flyway migration
+-- ordering and prevent FileNotFoundException errors.
+-- No changes needed as V1 already contains all seed data.
+-- ============================================================
+
+-- No-op: V1 already includes:
+--   3 default configurations (Managed Launcher, Background Agent, Kiosk Mode)
+--   28 system applications (Chrome, Maps, Gmail, YouTube, etc.)
+--   1 sample device (h0001)
