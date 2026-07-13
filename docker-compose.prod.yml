@@ -55,16 +55,15 @@ services:
     networks:
       - mdm-net
 
-  # React web app served via nginx
+  # React web app built from mdm-web/
   frontend:
-    image: nginx:alpine
+    build:
+      context: ../mdm-web
+      dockerfile: Dockerfile
     container_name: mdm-frontend
     restart: unless-stopped
     ports:
       - "${FRONTEND_PORT:-3000}:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf
-      - frontend_dist:/usr/share/nginx/html
     depends_on:
       - backend
     networks:
@@ -74,7 +73,6 @@ volumes:
   pgdata:
   mdmfiles:
   mqttdata:
-  frontend_dist:
 
 networks:
   mdm-net:

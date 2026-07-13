@@ -1,16 +1,18 @@
 # Multi-stage build for Spring Boot MDM Backend
+# ⚠ Note: .mvn/ wrapper directory is NOT tracked in git, so we use a direct Maven install
 FROM eclipse-temurin:17-jdk-alpine AS builder
 WORKDIR /app
 
-# Copy Maven wrapper + pom first (layer caching)
-COPY .mvn/ .mvn/
-COPY mvnw pom.xml ./
-RUN chmod +x mvnw
-RUN ./mvnw dependency:go-offline -q
+# Install Maven directly (more reliable than depending on .mvn wrapper in git)
+RUN apk add --no-cache maven
+
+# Copy pom first for layer caching
+COPY pom.xml ./
+RUN mvn dependency:go-offline -q
 
 # Copy source and build
 COPY src ./src
-RUN ./mvnw package -DskipTests -q
+RUN mvn package -DskipTests -q
 
 # ── Runtime image ──────────────────────────────────────────────
 FROM eclipse-temurin:17-jre-alpine
