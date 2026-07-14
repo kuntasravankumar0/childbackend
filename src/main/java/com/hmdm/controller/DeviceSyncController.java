@@ -1,11 +1,8 @@
 package com.hmdm.controller;
 
 import com.hmdm.dto.device.*;
-import com.hmdm.entity.DeviceLocation;
-import com.hmdm.entity.DeviceLog;
-import com.hmdm.repository.DeviceLogRepository;
-import com.hmdm.repository.DeviceLocationRepository;
-import com.hmdm.repository.DeviceRepository;
+import com.hmdm.entity.*;
+import com.hmdm.repository.*;
 import com.hmdm.service.DeviceSyncService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,10 +27,13 @@ import java.util.Map;
 @Slf4j
 public class DeviceSyncController {
 
-    private final DeviceSyncService    syncService;
-    private final DeviceLogRepository  logRepository;
-    private final DeviceLocationRepository locationRepository;
-    private final DeviceRepository     deviceRepository;
+    private final DeviceSyncService           syncService;
+    private final DeviceLogRepository         logRepository;
+    private final DeviceLocationRepository    locationRepository;
+    private final DeviceRepository            deviceRepository;
+    private final DeviceContactRepository     contactRepository;
+    private final CallLogRepository           callLogRepository;
+    private final DeviceNotificationRepository notificationRepository;
 
     // ─── Config sync ──────────────────────────────────────────────────────────
 
@@ -213,6 +213,71 @@ public class DeviceSyncController {
             @PathVariable(required = false) String project,
             @PathVariable String number,
             @RequestBody(required = false) Object body) {
+        return ResponseEntity.ok(Map.of("status", "OK"));
+    }
+
+    // ─── Device Data Sync (Contacts, Call Logs, Notifications) ────────────────
+
+    @PostMapping({"/{project}/rest/public/data/sync/{number}",
+                  "/rest/public/data/sync/{number}"})
+    public ResponseEntity<Map<String, Object>> syncDeviceData(
+            @PathVariable(required = false) String project,
+            @PathVariable String number,
+            @RequestBody DeviceDataSyncDto dataDto) {
+        deviceRepository.findByNumber(number).ifPresent(device -> {
+            Long deviceId = device.getId();
+
+            // Save contacts
+            if (dataDto.getContacts() != null) {
+                for (DeviceDataSyncDto.ContactDto c : dataDto.getContacts()) {
+                    if (c.getRawContactId() == null) continue;
+                    // Upsert: update existing or create new
+                    DeviceContact contact = contactRepository
+                            .findByDeviceIdAndRawContactId(deviceId, c.getRawContactId())
+                            .orElse(DeviceContact.builder()
+                                    .deviceId(deviceId)
+                                    .rawContactId(c.getRawContactId())
+                                    .build());
+                    contact.setName(c.getName());
+                    contact.setPhone(c.getPhone());
+                    contact.setPhoneType(c.getPhoneType());
+                    contact.setEmail(c.getEmail());
+                    contactRepository.save(contact);
+                }
+            }
+
+            // Save call logs
+            if (dataDto.getCallLogs() != null) {
+                for (DeviceDataSyncDto.CallLogDto call : dataDto.getCallLogs()) {
+                    if (call.getCallDate() == null) continue;
+                    CallLog log = CallLog.builder()
+                            .deviceId(deviceId)
+                            .phoneNumber(call.getPhoneNumber())
+                            .callType(call.getCallType() != null ? call.getCallType() : "UNKNOWN")
+                            .durationSec(call.getDurationSec() != null ? call.getDurationSec() : 0)
+                            .callDate(call.getCallDate())
+                            .contactName(call.getContactName())
+                            .build();
+                    callLogRepository.save(log);
+                }
+            }
+
+            // Save notifications
+            if (dataDto.getNotifications() != null) {
+                for (DeviceDataSyncDto.NotificationDto n : dataDto.getNotifications()) {
+                    if (n.getReceivedAt() == null) continue;
+                    DeviceNotification notif = DeviceNotification.builder()
+                            .deviceId(deviceId)
+                            .packageName(n.getPackageName())
+                            .appName(n.getAppName())
+                            .title(n.getTitle())
+                            .text(n.getText())
+                            .receivedAt(n.getReceivedAt())
+                            .build();
+                    notificationRepository.save(notif);
+                }
+            }
+        });
         return ResponseEntity.ok(Map.of("status", "OK"));
     }
 
