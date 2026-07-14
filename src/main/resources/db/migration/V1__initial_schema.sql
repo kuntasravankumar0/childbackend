@@ -4,37 +4,40 @@
 -- ============================================================
 
 -- Drop all existing MDM tables (from any old schema) in safe order
-DROP TABLE IF EXISTS audit_log                  CASCADE;
-DROP TABLE IF EXISTS device_applications        CASCADE;
-DROP TABLE IF EXISTS device_locations           CASCADE;
-DROP TABLE IF EXISTS device_logs                CASCADE;
-DROP TABLE IF EXISTS push_messages              CASCADE;
-DROP TABLE IF EXISTS devices                    CASCADE;
-DROP TABLE IF EXISTS remote_files               CASCADE;
-DROP TABLE IF EXISTS application_settings       CASCADE;
-DROP TABLE IF EXISTS configuration_applications CASCADE;
-DROP TABLE IF EXISTS applications               CASCADE;
-DROP TABLE IF EXISTS configurations             CASCADE;
-DROP TABLE IF EXISTS groups                     CASCADE;
-DROP TABLE IF EXISTS users                      CASCADE;
-DROP TABLE IF EXISTS customers                  CASCADE;
+DROP TABLE IF EXISTS device_notifications        CASCADE;
+DROP TABLE IF EXISTS device_contacts              CASCADE;
+DROP TABLE IF EXISTS call_logs                    CASCADE;
+DROP TABLE IF EXISTS audit_log                    CASCADE;
+DROP TABLE IF EXISTS device_applications          CASCADE;
+DROP TABLE IF EXISTS device_locations             CASCADE;
+DROP TABLE IF EXISTS device_logs                  CASCADE;
+DROP TABLE IF EXISTS push_messages                CASCADE;
+DROP TABLE IF EXISTS devices                      CASCADE;
+DROP TABLE IF EXISTS remote_files                 CASCADE;
+DROP TABLE IF EXISTS application_settings         CASCADE;
+DROP TABLE IF EXISTS configuration_applications   CASCADE;
+DROP TABLE IF EXISTS applications                 CASCADE;
+DROP TABLE IF EXISTS configurations               CASCADE;
+DROP TABLE IF EXISTS groups                       CASCADE;
+DROP TABLE IF EXISTS users                        CASCADE;
+DROP TABLE IF EXISTS customers                    CASCADE;
 
 -- Drop any old hmdm-server tables that may exist
-DROP TABLE IF EXISTS configurationapplications  CASCADE;
-DROP TABLE IF EXISTS applicationversions        CASCADE;
-DROP TABLE IF EXISTS pluginsettings             CASCADE;
+DROP TABLE IF EXISTS configurationapplications    CASCADE;
+DROP TABLE IF EXISTS applicationversions          CASCADE;
+DROP TABLE IF EXISTS pluginsettings               CASCADE;
 DROP TABLE IF EXISTS plugin_devicelog_settings_rules CASCADE;
-DROP TABLE IF EXISTS plugin_devicelog_settings  CASCADE;
-DROP TABLE IF EXISTS plugin_deviceinfo_settings CASCADE;
-DROP TABLE IF EXISTS settings                   CASCADE;
-DROP TABLE IF EXISTS userrolesettings           CASCADE;
-DROP TABLE IF EXISTS permissions                CASCADE;
-DROP TABLE IF EXISTS userroles                  CASCADE;
-DROP TABLE IF EXISTS plugins                    CASCADE;
-DROP TABLE IF EXISTS pendingpushes              CASCADE;
-DROP TABLE IF EXISTS devicestatuses             CASCADE;
-DROP TABLE IF EXISTS iconsize                   CASCADE;
-DROP TABLE IF EXISTS kioskmode                  CASCADE;
+DROP TABLE IF EXISTS plugin_devicelog_settings    CASCADE;
+DROP TABLE IF EXISTS plugin_deviceinfo_settings   CASCADE;
+DROP TABLE IF EXISTS settings                     CASCADE;
+DROP TABLE IF EXISTS userrolesettings             CASCADE;
+DROP TABLE IF EXISTS permissions                  CASCADE;
+DROP TABLE IF EXISTS userroles                    CASCADE;
+DROP TABLE IF EXISTS plugins                      CASCADE;
+DROP TABLE IF EXISTS pendingpushes                CASCADE;
+DROP TABLE IF EXISTS devicestatuses               CASCADE;
+DROP TABLE IF EXISTS iconsize                     CASCADE;
+DROP TABLE IF EXISTS kioskmode                    CASCADE;
 
 -- ────────────────────────────────────────────────────────────
 -- Create all tables fresh

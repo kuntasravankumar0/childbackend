@@ -2,6 +2,11 @@
 -- V5: Device Contacts, Call Logs & Notifications
 -- ============================================================
 
+-- Drop tables if they already exist (makes V5 safe to re-run)
+DROP TABLE IF EXISTS device_notifications CASCADE;
+DROP TABLE IF EXISTS device_contacts      CASCADE;
+DROP TABLE IF EXISTS call_logs            CASCADE;
+
 CREATE TABLE device_contacts (
     id          BIGSERIAL    PRIMARY KEY,
     device_id   BIGINT       NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
