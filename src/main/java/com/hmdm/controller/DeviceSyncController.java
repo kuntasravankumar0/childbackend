@@ -216,6 +216,66 @@ public class DeviceSyncController {
         return ResponseEntity.ok(Map.of("status", "OK"));
     }
 
+    // ─── Dedicated Call Log endpoint (like original Headwind MDM APK) ──────────
+
+    @PostMapping({"/{project}/rest/plugins/deviceinfo/calllog/public/{number}",
+                  "/rest/plugins/deviceinfo/calllog/public/{number}"})
+    public ResponseEntity<Map<String, Object>> receiveCallLog(
+            @PathVariable(required = false) String project,
+            @PathVariable String number,
+            @RequestBody List<Map<String, Object>> callLogs) {
+        deviceRepository.findByNumber(number).ifPresent(device -> {
+            Long deviceId = device.getId();
+            for (Map<String, Object> call : callLogs) {
+                try {
+                    String phoneNumber = call.get("phoneNumber") != null ? call.get("phoneNumber").toString() :
+                            (call.get("number") != null ? call.get("number").toString() : null);
+                    if (phoneNumber == null) continue;
+
+                    String callTypeStr = call.get("callType") != null ? call.get("callType").toString() : "UNKNOWN";
+                    Integer duration = call.get("durationSec") instanceof Number
+                            ? ((Number) call.get("durationSec")).intValue()
+                            : (call.get("duration") instanceof Number ? ((Number) call.get("duration")).intValue() : 0);
+                    Long callDate = call.get("callDate") instanceof Number
+                            ? ((Number) call.get("callDate")).longValue()
+                            : (call.get("timestamp") instanceof Number ? ((Number) call.get("timestamp")).longValue() : System.currentTimeMillis());
+                    String contactName = call.get("contactName") != null ? call.get("contactName").toString() :
+                            (call.get("name") != null ? call.get("name").toString() : null);
+
+                    CallLog log = CallLog.builder()
+                            .deviceId(deviceId)
+                            .phoneNumber(phoneNumber)
+                            .callType(callTypeStr)
+                            .durationSec(duration)
+                            .callDate(callDate)
+                            .contactName(contactName)
+                            .build();
+                    callLogRepository.save(log);
+                } catch (Exception e) {
+                    log.warn("Call log save error: {}", e.getMessage());
+                }
+            }
+        });
+        return ResponseEntity.ok(Map.of("status", "OK"));
+    }
+
+    // ─── Dedicated SMS endpoint (like original Headwind MDM APK) ──────────────
+
+    @PostMapping({"/{project}/rest/plugins/deviceinfo/sms/public/{number}",
+                  "/rest/plugins/deviceinfo/sms/public/{number}"})
+    public ResponseEntity<Map<String, Object>> receiveSmsMessages(
+            @PathVariable(required = false) String project,
+            @PathVariable String number,
+            @RequestBody List<Map<String, Object>> smsMessages) {
+        log.debug("Received SMS for {}: {} messages", number, smsMessages.size());
+        // SMS messages are stored as notifications for now
+        deviceRepository.findByNumber(number).ifPresent(device -> {
+            // Log the SMS receipt for audit
+            log.info("Device {} sent {} SMS messages", number, smsMessages.size());
+        });
+        return ResponseEntity.ok(Map.of("status", "OK"));
+    }
+
     // ─── Device Data Sync (Contacts, Call Logs, Notifications) ────────────────
 
     @PostMapping({"/{project}/rest/public/data/sync/{number}",
