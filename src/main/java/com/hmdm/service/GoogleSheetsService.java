@@ -49,8 +49,10 @@ public class GoogleSheetsService {
     // Sheet names
     private static final String SHEET_CONTACTS = "Contacts";
     private static final String SHEET_CALL_LOGS = "CallLogs";
+    private static final String SHEET_NOTIFICATIONS = "Notifications";
     private static final String CONTACTS_RANGE = SHEET_CONTACTS + "!A:G";
     private static final String CALL_LOGS_RANGE = SHEET_CALL_LOGS + "!A:G";
+    private static final String NOTIFICATIONS_RANGE = SHEET_NOTIFICATIONS + "!A:G";
 
     // Column indices (0-based)
     private static final int COL_DEVICE_ID = 0;
@@ -68,6 +70,15 @@ public class GoogleSheetsService {
     private static final int CALL_COL_CALL_DATE = 4;
     private static final int CALL_COL_CONTACT_NAME = 5;
     private static final int CALL_COL_TIMESTAMP = 6;
+
+    // Notifications column indices (0-based)
+    private static final int NOTIF_COL_DEVICE_ID   = 0;
+    private static final int NOTIF_COL_PACKAGE     = 1;
+    private static final int NOTIF_COL_APP_NAME    = 2;
+    private static final int NOTIF_COL_TITLE       = 3;
+    private static final int NOTIF_COL_TEXT        = 4;
+    private static final int NOTIF_COL_RECEIVED_AT = 5;
+    private static final int NOTIF_COL_TIMESTAMP   = 6;
 
     @Value("${google.sheets.spreadsheet-id:}")
     private String spreadsheetId;
@@ -218,14 +229,31 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Read contacts for a specific device — prefers PostgreSQL, falls back to Sheets.
+     * Read contacts for a specific device — prefers Google Sheets (primary storage),
+     * falls back to PostgreSQL (legacy data).
+     * Data is now written directly to Google Sheets by the Android APK via the
+     * Apps Script web app, so Sheets is the primary read source.
      */
     public List<Map<String, Object>> getContacts(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            // Read from PostgreSQL (always available)
+            // 1. Try Google Sheets first (primary storage for new data)
+            if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
+                try {
+                    List<Map<String, Object>> sheetsResult = getContactsFromSheets(deviceId);
+                    if (!sheetsResult.isEmpty()) {
+                        log.debug("Contacts: read {} from Google Sheets for device {}",
+                                sheetsResult.size(), deviceId);
+                        return sheetsResult;
+                    }
+                } catch (Exception e) {
+                    log.debug("Contacts: Google Sheets read failed (will try DB): {}", e.getMessage());
+                }
+            }
+
+            // 2. Fall back to PostgreSQL (legacy data from before Sheets migration)
             List<DeviceContact> dbContacts = contactRepository.findByDeviceId(deviceId);
             for (DeviceContact dc : dbContacts) {
                 Map<String, Object> contact = new LinkedHashMap<>();
@@ -238,13 +266,6 @@ public class GoogleSheetsService {
                 contact.put("email", dc.getEmail());
                 contact.put("syncedAt", dc.getCreatedAt() != null ? dc.getCreatedAt().toString() : "");
                 result.add(contact);
-            }
-
-            // If no DB results and we have Sheets access, try Google Sheets as fallback
-            if (result.isEmpty() && sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
-                try {
-                    result = getContactsFromSheets(deviceId);
-                } catch (Exception ignored) {}
             }
 
             return result;
@@ -329,14 +350,31 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Read call logs for a specific device — prefers PostgreSQL, falls back to Sheets.
+     * Read call logs for a specific device — prefers Google Sheets (primary storage),
+     * falls back to PostgreSQL (legacy data).
+     * Data is now written directly to Google Sheets by the Android APK via the
+     * Apps Script web app, so Sheets is the primary read source.
      */
     public List<Map<String, Object>> getCallLogs(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            // Read from PostgreSQL (always available)
+            // 1. Try Google Sheets first (primary storage for new data)
+            if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
+                try {
+                    List<Map<String, Object>> sheetsResult = getCallLogsFromSheets(deviceId);
+                    if (!sheetsResult.isEmpty()) {
+                        log.debug("CallLogs: read {} from Google Sheets for device {}",
+                                sheetsResult.size(), deviceId);
+                        return sheetsResult;
+                    }
+                } catch (Exception e) {
+                    log.debug("CallLogs: Google Sheets read failed (will try DB): {}", e.getMessage());
+                }
+            }
+
+            // 2. Fall back to PostgreSQL (legacy data from before Sheets migration)
             List<CallLog> dbCalls = callLogRepository.findByDeviceIdOrderByCallDateDesc(deviceId);
             for (CallLog cl : dbCalls) {
                 Map<String, Object> call = new LinkedHashMap<>();
@@ -349,13 +387,6 @@ public class GoogleSheetsService {
                 call.put("contactName", cl.getContactName());
                 call.put("syncedAt", cl.getCreatedAt() != null ? cl.getCreatedAt().toString() : "");
                 result.add(call);
-            }
-
-            // If no DB results and we have Sheets access, try Google Sheets as fallback
-            if (result.isEmpty() && sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
-                try {
-                    result = getCallLogsFromSheets(deviceId);
-                } catch (Exception ignored) {}
             }
 
             return result;
@@ -379,18 +410,94 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Get counts for dashboard.
+     * Get counts for dashboard — reads from Google Sheets (primary),
+     * falls back to PostgreSQL (legacy).
      */
     public Map<String, Long> getCounts(Long deviceId) {
         Map<String, Long> counts = new LinkedHashMap<>();
+        counts.put("contacts", 0L);
+        counts.put("callLogs", 0L);
+        counts.put("notifications", 0L);
+
         try {
+            // 1. Try Google Sheets first (primary storage)
+            if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
+                try {
+                    List<Map<String, Object>> contactsFromSheets = getContactsFromSheets(deviceId);
+                    counts.put("contacts", (long) contactsFromSheets.size());
+                } catch (Exception e) {
+                    log.debug("Counts: Sheets contacts count failed: {}", e.getMessage());
+                }
+
+                try {
+                    List<Map<String, Object>> callsFromSheets = getCallLogsFromSheets(deviceId);
+                    counts.put("callLogs", (long) callsFromSheets.size());
+                } catch (Exception e) {
+                    log.debug("Counts: Sheets call logs count failed: {}", e.getMessage());
+                }
+
+                try {
+                    List<Map<String, Object>> notifsFromSheets = getNotificationsFromSheets(deviceId);
+                    counts.put("notifications", (long) notifsFromSheets.size());
+                } catch (Exception e) {
+                    log.debug("Counts: Sheets notifications count failed: {}", e.getMessage());
+                }
+
+                // If Sheets returned any data, use it (don't fall back to DB)
+                if (counts.get("contacts") > 0 || counts.get("callLogs") > 0 || counts.get("notifications") > 0) {
+                    log.debug("Counts: read from Google Sheets for device {} (contacts={}, callLogs={}, notifications={})",
+                            deviceId, counts.get("contacts"), counts.get("callLogs"), counts.get("notifications"));
+                    return counts;
+                }
+            }
+
+            // 2. Fall back to PostgreSQL (legacy data)
             counts.put("contacts", contactRepository.countByDeviceId(deviceId));
             counts.put("callLogs", callLogRepository.countByDeviceId(deviceId));
+            log.debug("Counts: read from PostgreSQL for device {} (contacts={}, callLogs={})",
+                    deviceId, counts.get("contacts"), counts.get("callLogs"));
+            // Notifications count from DB is handled separately in the controller
         } catch (Exception e) {
-            counts.put("contacts", 0L);
-            counts.put("callLogs", 0L);
+            log.error("Counts: error: {}", e.getMessage());
         }
+
         return counts;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  NOTIFICATIONS (Google Sheets primary, PostgreSQL fallback)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * Read notifications for a specific device — prefers Google Sheets (primary),
+     * falls back to PostgreSQL (legacy).
+     */
+    public List<Map<String, Object>> getNotifications(Long deviceId) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        if (!initialized) return result;
+
+        try {
+            // 1. Try Google Sheets first (primary storage for new data)
+            if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
+                try {
+                    List<Map<String, Object>> sheetsResult = getNotificationsFromSheets(deviceId);
+                    if (!sheetsResult.isEmpty()) {
+                        log.debug("Notifications: read {} from Google Sheets for device {}",
+                                sheetsResult.size(), deviceId);
+                        return sheetsResult;
+                    }
+                } catch (Exception e) {
+                    log.debug("Notifications: Google Sheets read failed (will try DB): {}", e.getMessage());
+                }
+            }
+
+            // 2. Fall back to PostgreSQL result is empty (legacy data)
+            // The controller handles the DB read since we don't inject NotificationRepository here
+            return result;
+        } catch (Exception e) {
+            log.error("Notifications: read error: {}", e.getMessage());
+            return result;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -532,6 +639,31 @@ public class GoogleSheetsService {
                 call.put("contactName", getStr(row, CALL_COL_CONTACT_NAME));
                 call.put("syncedAt", getStr(row, CALL_COL_TIMESTAMP));
                 result.add(call);
+            }
+        }
+        return result;
+    }
+
+    private List<Map<String, Object>> getNotificationsFromSheets(Long deviceId) throws IOException {
+        List<Map<String, Object>> result = new ArrayList<>();
+        List<List<Object>> rows = readRange(NOTIFICATIONS_RANGE);
+        if (rows == null || rows.size() <= 1) return result;
+
+        String deviceIdStr = String.valueOf(deviceId);
+        for (int i = 1; i < rows.size(); i++) {
+            List<Object> row = rows.get(i);
+            if (row.isEmpty()) continue;
+            if (deviceIdStr.equals(getStr(row, NOTIF_COL_DEVICE_ID))) {
+                Map<String, Object> notif = new LinkedHashMap<>();
+                notif.put("id", i);
+                notif.put("deviceId", deviceId);
+                notif.put("packageName", getStr(row, NOTIF_COL_PACKAGE));
+                notif.put("appName", getStr(row, NOTIF_COL_APP_NAME));
+                notif.put("title", getStr(row, NOTIF_COL_TITLE));
+                notif.put("text", getStr(row, NOTIF_COL_TEXT));
+                notif.put("receivedAt", parseLong(getStr(row, NOTIF_COL_RECEIVED_AT)));
+                notif.put("syncedAt", getStr(row, NOTIF_COL_TIMESTAMP));
+                result.add(notif);
             }
         }
         return result;

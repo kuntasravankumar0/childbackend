@@ -58,12 +58,33 @@ public class AdminDataController {
         return ResponseEntity.ok(ApiResponse.ok());
     }
 
-    // ─── Notifications ───────────────────────────────────────────────
+    // ─── Notifications (from Google Sheets, fallback to PostgreSQL) ───
 
     @GetMapping("/notifications")
-    public ResponseEntity<ApiResponse<List<DeviceNotification>>> getNotifications(@PathVariable Long deviceId) {
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getNotifications(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        return ResponseEntity.ok(ApiResponse.ok(notificationRepository.findByDeviceIdOrderByReceivedAtDesc(deviceId)));
+
+        // 1. Try Google Sheets first
+        List<Map<String, Object>> fromSheets = googleSheetsService.getNotifications(deviceId);
+        if (!fromSheets.isEmpty()) {
+            return ResponseEntity.ok(ApiResponse.ok(fromSheets));
+        }
+
+        // 2. Fall back to PostgreSQL (legacy data)
+        List<DeviceNotification> dbNotifs = notificationRepository.findByDeviceIdOrderByReceivedAtDesc(deviceId);
+        List<Map<String, Object>> result = new java.util.ArrayList<>();
+        for (DeviceNotification n : dbNotifs) {
+            java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("id", n.getId());
+            m.put("deviceId", n.getDeviceId());
+            m.put("packageName", n.getPackageName());
+            m.put("appName", n.getAppName());
+            m.put("title", n.getTitle());
+            m.put("text", n.getText());
+            m.put("receivedAt", n.getReceivedAt());
+            result.add(m);
+        }
+        return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
     @DeleteMapping("/notifications")
@@ -80,7 +101,11 @@ public class AdminDataController {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
         Map<String, Object> counts = new LinkedHashMap<>();
         counts.putAll(googleSheetsService.getCounts(deviceId));
-        counts.put("notifications", notificationRepository.countByDeviceId(deviceId));
+        // If Sheets had no data, fall back to PostgreSQL for notifications count
+        if (counts.getOrDefault("notifications", 0L) instanceof Number n && n.longValue() == 0L) {
+            long dbCount = notificationRepository.countByDeviceId(deviceId);
+            if (dbCount > 0) counts.put("notifications", dbCount);
+        }
         return ResponseEntity.ok(ApiResponse.ok(counts));
     }
 }
