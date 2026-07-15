@@ -2,8 +2,6 @@ package com.hmdm.controller;
 
 import com.hmdm.dto.ApiResponse;
 import com.hmdm.entity.DeviceNotification;
-import com.hmdm.repository.CallLogRepository;
-import com.hmdm.repository.DeviceContactRepository;
 import com.hmdm.repository.DeviceNotificationRepository;
 import com.hmdm.repository.DeviceRepository;
 import com.hmdm.service.GoogleSheetsService;
