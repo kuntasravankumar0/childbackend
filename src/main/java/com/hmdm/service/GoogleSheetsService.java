@@ -95,9 +95,9 @@ public class GoogleSheetsService {
             return;
         }
 
-        try {
-            // Try service account first (required for Google Sheets write)
-            if (credentialsJson != null && !credentialsJson.isBlank()) {
+        // Try service account first (required for Google Sheets write)
+        if (credentialsJson != null && !credentialsJson.isBlank()) {
+            try {
                 GoogleCredentials credentials = ServiceAccountCredentials.fromStream(
                         new ByteArrayInputStream(credentialsJson.getBytes()))
                         .createScoped(Collections.singletonList(SheetsScopes.SPREADSHEETS));
@@ -106,28 +106,32 @@ public class GoogleSheetsService {
                 log.info("GoogleSheetsService: initialized with service account (read/write to Sheets)");
                 log.info("GoogleSheetsService: contacts & call logs will also sync to PostgreSQL");
                 return;
+            } catch (Exception e) {
+                log.warn("GoogleSheetsService: GOOGLE_SHEETS_CREDENTIALS present but invalid (not a valid JSON service account key). " +
+                        "Falling back to API key or PostgreSQL-only mode. Error: {}", e.getMessage());
+                // Fall through to try API key next
             }
+        }
 
-            // Fall back to API key (read-only Sheets) + PostgreSQL for writes
-            if (apiKey != null && !apiKey.isBlank()) {
+        // Fall back to API key (read-only Sheets) + PostgreSQL for writes
+        if (apiKey != null && !apiKey.isBlank()) {
+            try {
                 useApiKey = true;
                 sheetsService = createSheetsService(null);
                 initialized = true;
                 log.info("GoogleSheetsService: initialized with API key — " +
                         "Google Sheets is READ-ONLY. Contacts & call logs " +
                         "will be stored in PostgreSQL instead.");
-                log.info("GoogleSheetsService: To enable Sheets writes, set GOOGLE_SHEETS_CREDENTIALS " +
-                        "with a service account JSON key. Otherwise, DB storage works perfectly.");
                 return;
+            } catch (Exception e) {
+                log.warn("GoogleSheetsService: API key initialization failed: {}. Fallback to DB-only.", e.getMessage());
             }
-
-            // No API key — DB-only mode (no Google Sheets at all)
-            initialized = true;
-            log.info("GoogleSheetsService: no Google credentials — " +
-                    "contacts & call logs stored in PostgreSQL only");
-        } catch (Exception e) {
-            log.error("GoogleSheetsService: initialization failed: {}", e.getMessage());
         }
+
+        // No working credentials — DB-only mode (no Google Sheets at all)
+        initialized = true;
+        log.info("GoogleSheetsService: no valid Google credentials — " +
+                "contacts & call logs stored in PostgreSQL only");
     }
 
     /**
