@@ -31,6 +31,9 @@ public class AdminDeviceController {
     private final PushMessageRepository         pushMessageRepository;
     private final ConfigurationRepository       configurationRepository;
     private final DeviceApplicationRepository   deviceApplicationRepository;
+    private final DeviceContactRepository       contactRepository;
+    private final CallLogRepository             callLogRepository;
+    private final DeviceNotificationRepository  notificationRepository;
 
     /** List devices with pagination + search */
     @GetMapping
@@ -77,11 +80,16 @@ public class AdminDeviceController {
         }).orElse(ResponseEntity.notFound().build());
     }
 
-    /** Delete device */
+    /** Delete device with all related data */
     @DeleteMapping("/{id}")
     public ResponseEntity<ApiResponse<Void>> deleteDevice(@PathVariable Long id) {
         if (!deviceRepository.existsById(id)) return ResponseEntity.notFound().build();
-        // Clean up related data
+        // Clean up ALL related data before deleting the device
+        // (foreign key constraints require removing child records first)
+        contactRepository.deleteByDeviceId(id);
+        callLogRepository.deleteByDeviceId(id);
+        notificationRepository.deleteByDeviceId(id);
+        pushMessageRepository.deleteByDeviceId(id);
         logRepository.deleteByDeviceId(id);
         locationRepository.deleteByDeviceId(id);
         deviceApplicationRepository.deleteByDeviceId(id);

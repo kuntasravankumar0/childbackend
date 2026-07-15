@@ -10,4 +10,5 @@ import java.util.List;
 public interface PushMessageRepository extends JpaRepository<PushMessage, Long> {
     List<PushMessage> findByDeviceIdAndSentFalseOrderByCreatedAtAsc(Long deviceId);
     List<PushMessage> findByDeviceIdOrderByCreatedAtDesc(Long deviceId);
+    void deleteByDeviceId(Long deviceId);
 }
