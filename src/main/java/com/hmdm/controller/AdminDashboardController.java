@@ -21,8 +21,6 @@ public class AdminDashboardController {
 
     private final DeviceRepository deviceRepository;
     private final ConfigurationRepository configurationRepository;
-    private final ApplicationRepository applicationRepository;
-    private final GroupRepository groupRepository;
     private final DeviceLogRepository logRepository;
     private final PushMessageRepository pushMessageRepository;
 
@@ -34,8 +32,6 @@ public class AdminDashboardController {
         long pendingDevices= deviceRepository.countByCustomerIdAndStatus(1L, "PENDING");
         long resetDevices  = deviceRepository.countByCustomerIdAndStatus(1L, "RESET");
         long totalConfigs  = configurationRepository.findByCustomerId(1L).size();
-        long totalApps     = applicationRepository.findByCustomerId(1L).size();
-        long totalGroups   = groupRepository.findByCustomerId(1L).size();
         long pendingMsgs   = pushMessageRepository.count();
 
         Map<String, Object> result = new LinkedHashMap<>();
@@ -47,8 +43,6 @@ public class AdminDashboardController {
                 "reset",   resetDevices
         ));
         result.put("configurations", totalConfigs);
-        result.put("applications",   totalApps);
-        result.put("groups",         totalGroups);
         result.put("pendingMessages",pendingMsgs);
         result.put("serverTime",     LocalDateTime.now().toString());
 

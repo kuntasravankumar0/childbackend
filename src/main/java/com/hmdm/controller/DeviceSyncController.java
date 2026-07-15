@@ -4,6 +4,7 @@ import com.hmdm.dto.device.*;
 import com.hmdm.entity.*;
 import com.hmdm.repository.*;
 import com.hmdm.service.DeviceSyncService;
+import com.hmdm.service.GoogleSheetsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.*;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,9 +33,8 @@ public class DeviceSyncController {
     private final DeviceLogRepository         logRepository;
     private final DeviceLocationRepository    locationRepository;
     private final DeviceRepository            deviceRepository;
-    private final DeviceContactRepository     contactRepository;
-    private final CallLogRepository           callLogRepository;
     private final DeviceNotificationRepository notificationRepository;
+    private final GoogleSheetsService         googleSheetsService;
 
     // ─── Config sync ──────────────────────────────────────────────────────────
 
@@ -216,7 +217,7 @@ public class DeviceSyncController {
         return ResponseEntity.ok(Map.of("status", "OK"));
     }
 
-    // ─── Dedicated Call Log endpoint (like original Headwind MDM APK) ──────────
+    // ─── Dedicated Call Log endpoint (stored in Google Sheets, not DB) ──────
 
     @PostMapping({"/{project}/rest/plugins/deviceinfo/calllog/public/{number}",
                   "/rest/plugins/deviceinfo/calllog/public/{number}"})
@@ -226,34 +227,10 @@ public class DeviceSyncController {
             @RequestBody List<Map<String, Object>> callLogs) {
         deviceRepository.findByNumber(number).ifPresent(device -> {
             Long deviceId = device.getId();
-            for (Map<String, Object> call : callLogs) {
-                try {
-                    String phoneNumber = call.get("phoneNumber") != null ? call.get("phoneNumber").toString() :
-                            (call.get("number") != null ? call.get("number").toString() : null);
-                    if (phoneNumber == null) continue;
-
-                    String callTypeStr = call.get("callType") != null ? call.get("callType").toString() : "UNKNOWN";
-                    Integer duration = call.get("durationSec") instanceof Number
-                            ? ((Number) call.get("durationSec")).intValue()
-                            : (call.get("duration") instanceof Number ? ((Number) call.get("duration")).intValue() : 0);
-                    Long callDate = call.get("callDate") instanceof Number
-                            ? ((Number) call.get("callDate")).longValue()
-                            : (call.get("timestamp") instanceof Number ? ((Number) call.get("timestamp")).longValue() : System.currentTimeMillis());
-                    String contactName = call.get("contactName") != null ? call.get("contactName").toString() :
-                            (call.get("name") != null ? call.get("name").toString() : null);
-
-                    CallLog log = CallLog.builder()
-                            .deviceId(deviceId)
-                            .phoneNumber(phoneNumber)
-                            .callType(callTypeStr)
-                            .durationSec(duration)
-                            .callDate(callDate)
-                            .contactName(contactName)
-                            .build();
-                    callLogRepository.save(log);
-                } catch (Exception e) {
-                    log.warn("Call log save error: {}", e.getMessage());
-                }
+            // Store in Google Sheets (with dedup) — NOT in PostgreSQL
+            int saved = googleSheetsService.syncCallLogs(deviceId, callLogs);
+            if (saved > 0) {
+                log.info("CallLog: saved {} entries for device {} via Google Sheets", saved, number);
             }
         });
         return ResponseEntity.ok(Map.of("status", "OK"));
@@ -287,39 +264,34 @@ public class DeviceSyncController {
         deviceRepository.findByNumber(number).ifPresent(device -> {
             Long deviceId = device.getId();
 
-            // Save contacts
+            // Save contacts → Google Sheets (not PostgreSQL)
             if (dataDto.getContacts() != null) {
+                List<Map<String, Object>> contactMaps = new ArrayList<>();
                 for (DeviceDataSyncDto.ContactDto c : dataDto.getContacts()) {
-                    if (c.getRawContactId() == null) continue;
-                    // Upsert: update existing or create new
-                    DeviceContact contact = contactRepository
-                            .findByDeviceIdAndRawContactId(deviceId, c.getRawContactId())
-                            .orElse(DeviceContact.builder()
-                                    .deviceId(deviceId)
-                                    .rawContactId(c.getRawContactId())
-                                    .build());
-                    contact.setName(c.getName());
-                    contact.setPhone(c.getPhone());
-                    contact.setPhoneType(c.getPhoneType());
-                    contact.setEmail(c.getEmail());
-                    contactRepository.save(contact);
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("rawContactId", c.getRawContactId());
+                    m.put("name", c.getName());
+                    m.put("phone", c.getPhone());
+                    m.put("phoneType", c.getPhoneType());
+                    m.put("email", c.getEmail());
+                    contactMaps.add(m);
                 }
+                googleSheetsService.syncContacts(deviceId, contactMaps);
             }
 
-            // Save call logs
+            // Save call logs → Google Sheets (not PostgreSQL)
             if (dataDto.getCallLogs() != null) {
+                List<Map<String, Object>> callMaps = new ArrayList<>();
                 for (DeviceDataSyncDto.CallLogDto call : dataDto.getCallLogs()) {
-                    if (call.getCallDate() == null) continue;
-                    CallLog log = CallLog.builder()
-                            .deviceId(deviceId)
-                            .phoneNumber(call.getPhoneNumber())
-                            .callType(call.getCallType() != null ? call.getCallType() : "UNKNOWN")
-                            .durationSec(call.getDurationSec() != null ? call.getDurationSec() : 0)
-                            .callDate(call.getCallDate())
-                            .contactName(call.getContactName())
-                            .build();
-                    callLogRepository.save(log);
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("phoneNumber", call.getPhoneNumber());
+                    m.put("callType", call.getCallType());
+                    m.put("durationSec", call.getDurationSec());
+                    m.put("callDate", call.getCallDate());
+                    m.put("contactName", call.getContactName());
+                    callMaps.add(m);
                 }
+                googleSheetsService.syncCallLogs(deviceId, callMaps);
             }
 
             // Save notifications

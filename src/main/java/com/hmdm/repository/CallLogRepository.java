@@ -13,6 +13,10 @@ public interface CallLogRepository extends JpaRepository<CallLog, Long> {
     List<CallLog> findByDeviceIdOrderByCallDateDesc(Long deviceId);
     long countByDeviceId(Long deviceId);
 
+    // Dedup check: find by exact phoneNumber, callDate, callType, and contactName for a device
+    boolean existsByDeviceIdAndPhoneNumberAndCallDateAndCallTypeAndContactName(
+            Long deviceId, String phoneNumber, Long callDate, String callType, String contactName);
+
     @Modifying
     @Transactional
     void deleteByDeviceId(Long deviceId);

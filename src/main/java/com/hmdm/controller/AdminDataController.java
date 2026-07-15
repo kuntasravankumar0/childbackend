@@ -1,67 +1,63 @@
 package com.hmdm.controller;
 
 import com.hmdm.dto.ApiResponse;
-import com.hmdm.entity.CallLog;
-import com.hmdm.entity.DeviceContact;
 import com.hmdm.entity.DeviceNotification;
 import com.hmdm.repository.CallLogRepository;
 import com.hmdm.repository.DeviceContactRepository;
 import com.hmdm.repository.DeviceNotificationRepository;
 import com.hmdm.repository.DeviceRepository;
+import com.hmdm.service.GoogleSheetsService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 @RestController
 @RequestMapping("/api/devices/{deviceId}/data")
 @RequiredArgsConstructor
+@Slf4j
 @PreAuthorize("isAuthenticated()")
 public class AdminDataController {
 
     private final DeviceRepository deviceRepository;
-    private final DeviceContactRepository contactRepository;
-    private final CallLogRepository callLogRepository;
     private final DeviceNotificationRepository notificationRepository;
+    private final GoogleSheetsService googleSheetsService;
 
-    // ─── Contacts ─────────────────────────────────────────────────────
+    // ─── Contacts (from Google Sheets) ────────────────────────────────
 
     @GetMapping("/contacts")
-    public ResponseEntity<ApiResponse<List<DeviceContact>>> getContacts(@PathVariable Long deviceId) {
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getContacts(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        return ResponseEntity.ok(ApiResponse.ok(contactRepository.findByDeviceId(deviceId)));
+        List<Map<String, Object>> contacts = googleSheetsService.getContacts(deviceId);
+        return ResponseEntity.ok(ApiResponse.ok(contacts));
     }
 
     @DeleteMapping("/contacts")
     public ResponseEntity<ApiResponse<Void>> deleteContacts(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        contactRepository.deleteByDeviceId(deviceId);
+        // Google Sheets deletion is handled via overwrite — clear by marking
+        log.info("Delete contacts request for device {} (Google Sheets — manual deletion required)", deviceId);
         return ResponseEntity.ok(ApiResponse.ok());
     }
 
-    @DeleteMapping("/contacts/{contactId}")
-    public ResponseEntity<ApiResponse<Void>> deleteContact(@PathVariable Long deviceId,
-                                                            @PathVariable Long contactId) {
-        if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        contactRepository.deleteById(contactId);
-        return ResponseEntity.ok(ApiResponse.ok());
-    }
-
-    // ─── Call Logs ───────────────────────────────────────────────────
+    // ─── Call Logs (from Google Sheets) ───────────────────────────────
 
     @GetMapping("/calls")
-    public ResponseEntity<ApiResponse<List<CallLog>>> getCallLogs(@PathVariable Long deviceId) {
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getCallLogs(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        return ResponseEntity.ok(ApiResponse.ok(callLogRepository.findByDeviceIdOrderByCallDateDesc(deviceId)));
+        List<Map<String, Object>> calls = googleSheetsService.getCallLogs(deviceId);
+        return ResponseEntity.ok(ApiResponse.ok(calls));
     }
 
     @DeleteMapping("/calls")
     public ResponseEntity<ApiResponse<Void>> deleteCallLogs(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        callLogRepository.deleteByDeviceId(deviceId);
+        log.info("Delete call logs request for device {} (Google Sheets — manual deletion required)", deviceId);
         return ResponseEntity.ok(ApiResponse.ok());
     }
 
@@ -85,10 +81,9 @@ public class AdminDataController {
     @GetMapping("/counts")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getCounts(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "contacts",      contactRepository.countByDeviceId(deviceId),
-                "callLogs",      callLogRepository.countByDeviceId(deviceId),
-                "notifications", notificationRepository.countByDeviceId(deviceId)
-        )));
+        Map<String, Object> counts = new LinkedHashMap<>();
+        counts.putAll(googleSheetsService.getCounts(deviceId));
+        counts.put("notifications", notificationRepository.countByDeviceId(deviceId));
+        return ResponseEntity.ok(ApiResponse.ok(counts));
     }
 }
