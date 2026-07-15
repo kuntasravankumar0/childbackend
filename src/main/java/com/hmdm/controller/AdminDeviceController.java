@@ -13,6 +13,7 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
@@ -82,6 +83,7 @@ public class AdminDeviceController {
 
     /** Delete device with all related data */
     @DeleteMapping("/{id}")
+    @Transactional
     public ResponseEntity<ApiResponse<Void>> deleteDevice(@PathVariable Long id) {
         if (!deviceRepository.existsById(id)) return ResponseEntity.notFound().build();
         // Clean up ALL related data before deleting the device
