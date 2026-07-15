@@ -10,8 +10,13 @@ import com.google.api.services.sheets.v4.model.*;
 import com.google.auth.http.HttpCredentialsAdapter;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.auth.oauth2.ServiceAccountCredentials;
+import com.hmdm.entity.CallLog;
+import com.hmdm.entity.DeviceContact;
+import com.hmdm.repository.CallLogRepository;
+import com.hmdm.repository.DeviceContactRepository;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -19,10 +24,10 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * Service for syncing device contacts and call logs to Google Sheets.
@@ -73,6 +78,12 @@ public class GoogleSheetsService {
     @Value("${google.sheets.api-key:}")
     private String apiKey;
 
+    @Autowired
+    private DeviceContactRepository contactRepository;
+
+    @Autowired
+    private CallLogRepository callLogRepository;
+
     private Sheets sheetsService;
     private boolean initialized = false;
     private boolean useApiKey = false;
@@ -85,34 +96,35 @@ public class GoogleSheetsService {
         }
 
         try {
-            // Try service account first (required for write operations)
+            // Try service account first (required for Google Sheets write)
             if (credentialsJson != null && !credentialsJson.isBlank()) {
                 GoogleCredentials credentials = ServiceAccountCredentials.fromStream(
                         new ByteArrayInputStream(credentialsJson.getBytes()))
                         .createScoped(Collections.singletonList(SheetsScopes.SPREADSHEETS));
                 sheetsService = createSheetsService(credentials);
                 initialized = true;
-                log.info("GoogleSheetsService: initialized with service account (read/write)");
+                log.info("GoogleSheetsService: initialized with service account (read/write to Sheets)");
+                log.info("GoogleSheetsService: contacts & call logs will also sync to PostgreSQL");
                 return;
             }
 
-            // Fall back to API key (read-only)
+            // Fall back to API key (read-only Sheets) + PostgreSQL for writes
             if (apiKey != null && !apiKey.isBlank()) {
                 useApiKey = true;
                 sheetsService = createSheetsService(null);
                 initialized = true;
-                log.warn("GoogleSheetsService: initialized with API key — READ ONLY! " +
-                        "Writes will fail. To enable writes, create a service account at " +
-                        "https://console.cloud.google.com/apis/credentials, download the JSON, " +
-                        "share your sheet with the service account email, and set " +
-                        "GOOGLE_SHEETS_CREDENTIALS env var with the JSON contents.");
-
-                // Test write access immediately
-                testWriteAccess();
+                log.info("GoogleSheetsService: initialized with API key — " +
+                        "Google Sheets is READ-ONLY. Contacts & call logs " +
+                        "will be stored in PostgreSQL instead.");
+                log.info("GoogleSheetsService: To enable Sheets writes, set GOOGLE_SHEETS_CREDENTIALS " +
+                        "with a service account JSON key. Otherwise, DB storage works perfectly.");
                 return;
             }
 
-            log.warn("GoogleSheetsService: no credentials or API key configured — disabled");
+            // No API key — DB-only mode (no Google Sheets at all)
+            initialized = true;
+            log.info("GoogleSheetsService: no Google credentials — " +
+                    "contacts & call logs stored in PostgreSQL only");
         } catch (Exception e) {
             log.error("GoogleSheetsService: initialization failed: {}", e.getMessage());
         }
@@ -121,44 +133,7 @@ public class GoogleSheetsService {
     /**
      * Test if we can write to the sheet. Logs a warning if we can't.
      */
-    private void testWriteAccess() {
-        try {
-            List<List<Object>> testValues = new ArrayList<>();
-            testValues.add(Arrays.asList("MDM Test Write", "Testing write access", timestampNow()));
-            String testRange = SHEET_CONTACTS + "!A1:C1";
 
-            var body = new ValueRange().setValues(testValues);
-            sheetsService.spreadsheets().values()
-                    .append(spreadsheetId, testRange, body)
-                    .setValueInputOption("USER_ENTERED")
-                    .setKey(apiKey)
-                    .execute();
-
-            log.info("GoogleSheetsService: write test SUCCESS — API key has write access");
-        } catch (Exception e) {
-            String msg = e.getMessage() != null ? e.getMessage() : "";
-            if (msg.contains("403") || msg.contains("401")) {
-                log.warn("GoogleSheetsService: API key does NOT have write access (HTTP 403). " +
-                        "Contacts & call logs will NOT be saved. " +
-                        "Action required: Create a service account at " +
-                        "https://console.cloud.google.com/apis/credentials, " +
-                        "share your sheet with the service account email, " +
-                        "and set GOOGLE_SHEETS_CREDENTIALS env var.");
-            } else {
-                log.warn("GoogleSheetsService: write test failed: {} — sync may not work", msg);
-            }
-        }
-
-        // Clean up test rows
-        try {
-            var clearBody = new ValueRange().setValues(new ArrayList<>());
-            sheetsService.spreadsheets().values()
-                    .update(spreadsheetId, SHEET_CONTACTS + "!A1:C1", clearBody)
-                    .setValueInputOption("USER_ENTERED")
-                    .setKey(apiKey)
-                    .execute();
-        } catch (Exception ignored) {}
-    }
 
     private Sheets createSheetsService(GoogleCredentials credentials) throws GeneralSecurityException, IOException {
         var httpTransport = GoogleNetHttpTransport.newTrustedTransport();
@@ -177,38 +152,19 @@ public class GoogleSheetsService {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  CONTACTS
+    //  CONTACTS  (PostgreSQL primary, Google Sheets optional)
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Upsert contacts into Google Sheets.
+     * Upsert contacts into PostgreSQL (primary) + Google Sheets (if service account available).
      * Dedup by deviceId + rawContactId.
      */
     public int syncContacts(Long deviceId, List<Map<String, Object>> contacts) {
         if (!initialized) return 0;
 
         try {
-            // Ensure sheet exists
-            ensureSheetExists(SHEET_CONTACTS, Arrays.asList("DeviceID", "RawContactID", "Name", "Phone", "PhoneType", "Email", "Timestamp"));
-
-            // Read existing data
-            List<List<Object>> existingRows = readRange(CONTACTS_RANGE);
-            Map<String, Integer> existingMap = new HashMap<>(); // key -> row index
-            if (existingRows != null && !existingRows.isEmpty()) {
-                // Skip header
-                for (int i = 1; i < existingRows.size(); i++) {
-                    List<Object> row = existingRows.get(i);
-                    if (row.size() > COL_PHONE) {
-                        String key = deviceId + ":" + getStr(row, COL_RAW_CONTACT_ID);
-                        existingMap.put(key, i);
-                    }
-                }
-            }
-
-            List<List<Object>> rowsToAppend = new ArrayList<>();
-            List<Map<Integer, List<Object>>> rowsToUpdate = new ArrayList<>(); // {rowIndex -> newValues}
-            String now = timestampNow();
-
+            // Always save to PostgreSQL
+            int dbSaved = 0;
             for (Map<String, Object> contact : contacts) {
                 String rawContactId = getStr(contact, "rawContactId");
                 String name = getStr(contact, "name");
@@ -216,185 +172,206 @@ public class GoogleSheetsService {
                 String phoneType = getStr(contact, "phoneType");
                 String email = getStr(contact, "email");
 
-                String key = deviceId + ":" + rawContactId;
-
-                if (existingMap.containsKey(key)) {
-                    // Update existing row
-                    int rowIndex = existingMap.get(key);
-                    List<Object> newValues = Arrays.asList(
-                            String.valueOf(deviceId), rawContactId, name, phone, phoneType, email, now);
-                    Map<Integer, List<Object>> update = new HashMap<>();
-                    update.put(rowIndex, newValues);
-                    rowsToUpdate.add(update);
+                // Dedup check: find by deviceId + rawContactId
+                var existing = contactRepository.findByDeviceIdAndRawContactId(deviceId, rawContactId);
+                if (existing.isPresent()) {
+                    DeviceContact dc = existing.get();
+                    dc.setName(name);
+                    dc.setPhone(phone);
+                    dc.setPhoneType(phoneType);
+                    dc.setEmail(email);
+                    contactRepository.save(dc);
                 } else {
-                    // New row
-                    rowsToAppend.add(Arrays.asList(
-                            String.valueOf(deviceId), rawContactId, name, phone, phoneType, email, now));
+                    contactRepository.save(DeviceContact.builder()
+                            .deviceId(deviceId)
+                            .rawContactId(rawContactId)
+                            .name(name)
+                            .phone(phone)
+                            .phoneType(phoneType)
+                            .email(email)
+                            .build());
+                }
+                dbSaved++;
+            }
+
+            // Also sync to Google Sheets if we have a service account (write access)
+            if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
+                try {
+                    syncContactsToSheets(deviceId, contacts);
+                } catch (Exception e) {
+                    log.warn("GoogleSheets: sheets sync failed (this is ok — data is in DB): {}", e.getMessage());
                 }
             }
 
-            int updated = 0;
-            // Append new rows
-            if (!rowsToAppend.isEmpty()) {
-                appendRange(SHEET_CONTACTS + "!A:G", rowsToAppend);
-                updated += rowsToAppend.size();
+            if (dbSaved > 0) {
+                log.info("Contacts: saved {} to PostgreSQL for device {}", dbSaved, deviceId);
             }
-
-            // Update existing rows
-            for (Map<Integer, List<Object>> update : rowsToUpdate) {
-                for (Map.Entry<Integer, List<Object>> entry : update.entrySet()) {
-                    int rowIdx = entry.getKey();
-                    List<Object> vals = entry.getValue();
-                    String range = SHEET_CONTACTS + "!A" + (rowIdx + 1) + ":G" + (rowIdx + 1);
-                    updateRange(range, Collections.singletonList(vals));
-                    updated++;
-                }
-            }
-
-            if (updated > 0) {
-                log.info("GoogleSheets: synced {} contacts for device {}", updated, deviceId);
-            }
-            return updated;
+            return dbSaved;
         } catch (Exception e) {
-            log.error("GoogleSheets: contact sync error: {}", e.getMessage());
+            log.error("Contacts: DB sync error: {}", e.getMessage());
             return 0;
         }
     }
 
     /**
-     * Read contacts for a specific device from Google Sheets.
+     * Read contacts for a specific device — prefers PostgreSQL, falls back to Sheets.
      */
     public List<Map<String, Object>> getContacts(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            List<List<Object>> rows = readRange(CONTACTS_RANGE);
-            if (rows == null || rows.size() <= 1) return result;
-
-            String deviceIdStr = String.valueOf(deviceId);
-            for (int i = 1; i < rows.size(); i++) {
-                List<Object> row = rows.get(i);
-                if (row.isEmpty()) continue;
-                if (deviceIdStr.equals(getStr(row, COL_DEVICE_ID))) {
-                    Map<String, Object> contact = new LinkedHashMap<>();
-                    contact.put("id", i);
-                    contact.put("deviceId", deviceId);
-                    contact.put("rawContactId", getStr(row, COL_RAW_CONTACT_ID));
-                    contact.put("name", getStr(row, COL_NAME));
-                    contact.put("phone", getStr(row, COL_PHONE));
-                    contact.put("phoneType", getStr(row, COL_PHONE_TYPE));
-                    contact.put("email", getStr(row, COL_EMAIL));
-                    contact.put("syncedAt", getStr(row, COL_TIMESTAMP));
-                    result.add(contact);
-                }
+            // Read from PostgreSQL (always available)
+            List<DeviceContact> dbContacts = contactRepository.findByDeviceId(deviceId);
+            for (DeviceContact dc : dbContacts) {
+                Map<String, Object> contact = new LinkedHashMap<>();
+                contact.put("id", dc.getId());
+                contact.put("deviceId", dc.getDeviceId());
+                contact.put("rawContactId", dc.getRawContactId());
+                contact.put("name", dc.getName());
+                contact.put("phone", dc.getPhone());
+                contact.put("phoneType", dc.getPhoneType());
+                contact.put("email", dc.getEmail());
+                contact.put("syncedAt", dc.getCreatedAt() != null ? dc.getCreatedAt().toString() : "");
+                result.add(contact);
             }
+
+            // If no DB results and we have Sheets access, try Google Sheets as fallback
+            if (result.isEmpty() && sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
+                try {
+                    result = getContactsFromSheets(deviceId);
+                } catch (Exception ignored) {}
+            }
+
+            return result;
         } catch (Exception e) {
-            log.error("GoogleSheets: get contacts error: {}", e.getMessage());
+            log.error("Contacts: read error: {}", e.getMessage());
+            return result;
         }
-        return result;
+    }
+
+    /**
+     * Delete all contacts for a device from PostgreSQL.
+     */
+    public void deleteContacts(Long deviceId) {
+        if (!initialized) return;
+        try {
+            contactRepository.deleteByDeviceId(deviceId);
+            log.info("Contacts: deleted all for device {}", deviceId);
+        } catch (Exception e) {
+            log.error("Contacts: delete error: {}", e.getMessage());
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  CALL LOGS
+    //  CALL LOGS  (PostgreSQL primary, Google Sheets optional)
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Upsert call logs into Google Sheets.
+     * Upsert call logs into PostgreSQL (primary) + Google Sheets (if service account available).
      * Dedup by deviceId + phoneNumber + callDate + callType + contactName.
      */
     public int syncCallLogs(Long deviceId, List<Map<String, Object>> callLogs) {
         if (!initialized) return 0;
 
         try {
-            ensureSheetExists(SHEET_CALL_LOGS, Arrays.asList(
-                    "DeviceID", "PhoneNumber", "CallType", "DurationSec", "CallDate", "ContactName", "Timestamp"));
-
-            List<List<Object>> existingRows = readRange(CALL_LOGS_RANGE);
-            Set<String> existingSet = new HashSet<>();
-            if (existingRows != null && !existingRows.isEmpty()) {
-                for (int i = 1; i < existingRows.size(); i++) {
-                    List<Object> row = existingRows.get(i);
-                    if (row.size() > CALL_COL_CONTACT_NAME) {
-                        String key = deviceId + ":" +
-                                getStr(row, CALL_COL_PHONE_NUMBER) + ":" +
-                                getStr(row, CALL_COL_CALL_DATE) + ":" +
-                                getStr(row, CALL_COL_CALL_TYPE) + ":" +
-                                getStr(row, CALL_COL_CONTACT_NAME);
-                        existingSet.add(key);
-                    }
-                }
-            }
-
-            String now = timestampNow();
-            List<List<Object>> rowsToAppend = new ArrayList<>();
+            int saved = 0;
             int skipped = 0;
 
             for (Map<String, Object> call : callLogs) {
                 String phoneNumber = getStr(call, "phoneNumber");
                 String callType = getStr(call, "callType");
-                String callDate = getStr(call, "callDate");
-                String durationSec = String.valueOf(call.get("durationSec"));
+                Long callDate = parseLong(getStr(call, "callDate"));
+                Integer durationSec = parseInt(String.valueOf(call.getOrDefault("durationSec", 0)));
                 String contactName = getStr(call, "contactName");
 
-                String key = deviceId + ":" + phoneNumber + ":" + callDate + ":" + callType + ":" + contactName;
-
-                if (existingSet.contains(key)) {
+                // Dedup check via repository
+                boolean exists = callLogRepository.existsByDeviceIdAndPhoneNumberAndCallDateAndCallTypeAndContactName(
+                        deviceId, phoneNumber, callDate, callType, contactName);
+                if (exists) {
                     skipped++;
                     continue;
                 }
 
-                rowsToAppend.add(Arrays.asList(
-                        String.valueOf(deviceId), phoneNumber, callType, durationSec, callDate, contactName, now));
+                callLogRepository.save(CallLog.builder()
+                        .deviceId(deviceId)
+                        .phoneNumber(phoneNumber)
+                        .callType(callType)
+                        .durationSec(durationSec)
+                        .callDate(callDate)
+                        .contactName(contactName)
+                        .build());
+                saved++;
             }
 
-            if (!rowsToAppend.isEmpty()) {
-                appendRange(SHEET_CALL_LOGS + "!A:G", rowsToAppend);
+            // Also sync to Google Sheets if we have a service account (write access)
+            if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
+                try {
+                    syncCallLogsToSheets(deviceId, callLogs);
+                } catch (Exception e) {
+                    log.warn("GoogleSheets: call log sheets sync failed (data is in DB): {}", e.getMessage());
+                }
             }
 
-            if (skipped > 0 || !rowsToAppend.isEmpty()) {
-                log.info("GoogleSheets: synced {} call logs for device {} (skipped {} dups)",
-                        rowsToAppend.size(), deviceId, skipped);
+            if (saved > 0 || skipped > 0) {
+                log.info("CallLogs: saved {} to PostgreSQL for device {} (skipped {} dups)",
+                        saved, deviceId, skipped);
             }
-            return rowsToAppend.size();
+            return saved;
         } catch (Exception e) {
-            log.error("GoogleSheets: call log sync error: {}", e.getMessage());
+            log.error("CallLogs: DB sync error: {}", e.getMessage());
             return 0;
         }
     }
 
     /**
-     * Read call logs for a specific device from Google Sheets.
+     * Read call logs for a specific device — prefers PostgreSQL, falls back to Sheets.
      */
     public List<Map<String, Object>> getCallLogs(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            List<List<Object>> rows = readRange(CALL_LOGS_RANGE);
-            if (rows == null || rows.size() <= 1) return result;
-
-            String deviceIdStr = String.valueOf(deviceId);
-            for (int i = 1; i < rows.size(); i++) {
-                List<Object> row = rows.get(i);
-                if (row.isEmpty()) continue;
-                if (deviceIdStr.equals(getStr(row, CALL_COL_DEVICE_ID))) {
-                    Map<String, Object> call = new LinkedHashMap<>();
-                    call.put("id", i);
-                    call.put("deviceId", deviceId);
-                    call.put("phoneNumber", getStr(row, CALL_COL_PHONE_NUMBER));
-                    call.put("callType", getStr(row, CALL_COL_CALL_TYPE));
-                    call.put("durationSec", parseInt(getStr(row, CALL_COL_DURATION_SEC)));
-                    call.put("callDate", parseLong(getStr(row, CALL_COL_CALL_DATE)));
-                    call.put("contactName", getStr(row, CALL_COL_CONTACT_NAME));
-                    call.put("syncedAt", getStr(row, CALL_COL_TIMESTAMP));
-                    result.add(call);
-                }
+            // Read from PostgreSQL (always available)
+            List<CallLog> dbCalls = callLogRepository.findByDeviceIdOrderByCallDateDesc(deviceId);
+            for (CallLog cl : dbCalls) {
+                Map<String, Object> call = new LinkedHashMap<>();
+                call.put("id", cl.getId());
+                call.put("deviceId", cl.getDeviceId());
+                call.put("phoneNumber", cl.getPhoneNumber());
+                call.put("callType", cl.getCallType());
+                call.put("durationSec", cl.getDurationSec());
+                call.put("callDate", cl.getCallDate());
+                call.put("contactName", cl.getContactName());
+                call.put("syncedAt", cl.getCreatedAt() != null ? cl.getCreatedAt().toString() : "");
+                result.add(call);
             }
+
+            // If no DB results and we have Sheets access, try Google Sheets as fallback
+            if (result.isEmpty() && sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
+                try {
+                    result = getCallLogsFromSheets(deviceId);
+                } catch (Exception ignored) {}
+            }
+
+            return result;
         } catch (Exception e) {
-            log.error("GoogleSheets: get call logs error: {}", e.getMessage());
+            log.error("CallLogs: read error: {}", e.getMessage());
+            return result;
         }
-        return result;
+    }
+
+    /**
+     * Delete all call logs for a device from PostgreSQL.
+     */
+    public void deleteCallLogs(Long deviceId) {
+        if (!initialized) return;
+        try {
+            callLogRepository.deleteByDeviceId(deviceId);
+            log.info("CallLogs: deleted all for device {}", deviceId);
+        } catch (Exception e) {
+            log.error("CallLogs: delete error: {}", e.getMessage());
+        }
     }
 
     /**
@@ -402,9 +379,158 @@ public class GoogleSheetsService {
      */
     public Map<String, Long> getCounts(Long deviceId) {
         Map<String, Long> counts = new LinkedHashMap<>();
-        counts.put("contacts", (long) getContacts(deviceId).size());
-        counts.put("callLogs", (long) getCallLogs(deviceId).size());
+        try {
+            counts.put("contacts", contactRepository.countByDeviceId(deviceId));
+            counts.put("callLogs", callLogRepository.countByDeviceId(deviceId));
+        } catch (Exception e) {
+            counts.put("contacts", 0L);
+            counts.put("callLogs", 0L);
+        }
         return counts;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  GOOGLE SHEETS SPECIFIC METHODS (used only with service account)
+    // ═══════════════════════════════════════════════════════════════════
+
+    private void syncContactsToSheets(Long deviceId, List<Map<String, Object>> contacts) throws IOException {
+        ensureSheetExists(SHEET_CONTACTS, Arrays.asList("DeviceID", "RawContactID", "Name", "Phone", "PhoneType", "Email", "Timestamp"));
+
+        List<List<Object>> existingRows = readRange(CONTACTS_RANGE);
+        Map<String, Integer> existingMap = new HashMap<>();
+        if (existingRows != null && !existingRows.isEmpty()) {
+            for (int i = 1; i < existingRows.size(); i++) {
+                List<Object> row = existingRows.get(i);
+                if (row.size() > COL_PHONE) {
+                    String key = deviceId + ":" + getStr(row, COL_RAW_CONTACT_ID);
+                    existingMap.put(key, i);
+                }
+            }
+        }
+
+        List<List<Object>> rowsToAppend = new ArrayList<>();
+        String now = timestampNow();
+
+        for (Map<String, Object> contact : contacts) {
+            String rawContactId = getStr(contact, "rawContactId");
+            String name = getStr(contact, "name");
+            String phone = getStr(contact, "phone");
+            String phoneType = getStr(contact, "phoneType");
+            String email = getStr(contact, "email");
+
+            String key = deviceId + ":" + rawContactId;
+
+            if (existingMap.containsKey(key)) {
+                int rowIndex = existingMap.get(key);
+                String range = SHEET_CONTACTS + "!A" + (rowIndex + 1) + ":G" + (rowIndex + 1);
+                updateRange(range, Collections.singletonList(Arrays.asList(
+                        String.valueOf(deviceId), rawContactId, name, phone, phoneType, email, now)));
+            } else {
+                rowsToAppend.add(Arrays.asList(
+                        String.valueOf(deviceId), rawContactId, name, phone, phoneType, email, now));
+            }
+        }
+
+        if (!rowsToAppend.isEmpty()) {
+            appendRange(SHEET_CONTACTS + "!A:G", rowsToAppend);
+        }
+    }
+
+    private List<Map<String, Object>> getContactsFromSheets(Long deviceId) throws IOException {
+        List<Map<String, Object>> result = new ArrayList<>();
+        List<List<Object>> rows = readRange(CONTACTS_RANGE);
+        if (rows == null || rows.size() <= 1) return result;
+
+        String deviceIdStr = String.valueOf(deviceId);
+        for (int i = 1; i < rows.size(); i++) {
+            List<Object> row = rows.get(i);
+            if (row.isEmpty()) continue;
+            if (deviceIdStr.equals(getStr(row, COL_DEVICE_ID))) {
+                Map<String, Object> contact = new LinkedHashMap<>();
+                contact.put("id", i);
+                contact.put("deviceId", deviceId);
+                contact.put("rawContactId", getStr(row, COL_RAW_CONTACT_ID));
+                contact.put("name", getStr(row, COL_NAME));
+                contact.put("phone", getStr(row, COL_PHONE));
+                contact.put("phoneType", getStr(row, COL_PHONE_TYPE));
+                contact.put("email", getStr(row, COL_EMAIL));
+                contact.put("syncedAt", getStr(row, COL_TIMESTAMP));
+                result.add(contact);
+            }
+        }
+        return result;
+    }
+
+    private void syncCallLogsToSheets(Long deviceId, List<Map<String, Object>> callLogs) throws IOException {
+        ensureSheetExists(SHEET_CALL_LOGS, Arrays.asList(
+                "DeviceID", "PhoneNumber", "CallType", "DurationSec", "CallDate", "ContactName", "Timestamp"));
+
+        List<List<Object>> existingRows = readRange(CALL_LOGS_RANGE);
+        Set<String> existingSet = new HashSet<>();
+        if (existingRows != null && !existingRows.isEmpty()) {
+            for (int i = 1; i < existingRows.size(); i++) {
+                List<Object> row = existingRows.get(i);
+                if (row.size() > CALL_COL_CONTACT_NAME) {
+                    String key = deviceId + ":" +
+                            getStr(row, CALL_COL_PHONE_NUMBER) + ":" +
+                            getStr(row, CALL_COL_CALL_DATE) + ":" +
+                            getStr(row, CALL_COL_CALL_TYPE) + ":" +
+                            getStr(row, CALL_COL_CONTACT_NAME);
+                    existingSet.add(key);
+                }
+            }
+        }
+
+        String now = timestampNow();
+        List<List<Object>> rowsToAppend = new ArrayList<>();
+
+        for (Map<String, Object> call : callLogs) {
+            String key = deviceId + ":" +
+                    getStr(call, "phoneNumber") + ":" +
+                    getStr(call, "callDate") + ":" +
+                    getStr(call, "callType") + ":" +
+                    getStr(call, "contactName");
+
+            if (!existingSet.contains(key)) {
+                rowsToAppend.add(Arrays.asList(
+                        String.valueOf(deviceId),
+                        getStr(call, "phoneNumber"),
+                        getStr(call, "callType"),
+                        String.valueOf(call.getOrDefault("durationSec", 0)),
+                        getStr(call, "callDate"),
+                        getStr(call, "contactName"),
+                        now));
+            }
+        }
+
+        if (!rowsToAppend.isEmpty()) {
+            appendRange(SHEET_CALL_LOGS + "!A:G", rowsToAppend);
+        }
+    }
+
+    private List<Map<String, Object>> getCallLogsFromSheets(Long deviceId) throws IOException {
+        List<Map<String, Object>> result = new ArrayList<>();
+        List<List<Object>> rows = readRange(CALL_LOGS_RANGE);
+        if (rows == null || rows.size() <= 1) return result;
+
+        String deviceIdStr = String.valueOf(deviceId);
+        for (int i = 1; i < rows.size(); i++) {
+            List<Object> row = rows.get(i);
+            if (row.isEmpty()) continue;
+            if (deviceIdStr.equals(getStr(row, CALL_COL_DEVICE_ID))) {
+                Map<String, Object> call = new LinkedHashMap<>();
+                call.put("id", i);
+                call.put("deviceId", deviceId);
+                call.put("phoneNumber", getStr(row, CALL_COL_PHONE_NUMBER));
+                call.put("callType", getStr(row, CALL_COL_CALL_TYPE));
+                call.put("durationSec", parseInt(getStr(row, CALL_COL_DURATION_SEC)));
+                call.put("callDate", parseLong(getStr(row, CALL_COL_CALL_DATE)));
+                call.put("contactName", getStr(row, CALL_COL_CONTACT_NAME));
+                call.put("syncedAt", getStr(row, CALL_COL_TIMESTAMP));
+                result.add(call);
+            }
+        }
+        return result;
     }
 
     // ═══════════════════════════════════════════════════════════════════

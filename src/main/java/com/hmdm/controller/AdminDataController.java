@@ -38,8 +38,7 @@ public class AdminDataController {
     @DeleteMapping("/contacts")
     public ResponseEntity<ApiResponse<Void>> deleteContacts(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        // Google Sheets deletion is handled via overwrite — clear by marking
-        log.info("Delete contacts request for device {} (Google Sheets — manual deletion required)", deviceId);
+        googleSheetsService.deleteContacts(deviceId);
         return ResponseEntity.ok(ApiResponse.ok());
     }
 
@@ -55,7 +54,7 @@ public class AdminDataController {
     @DeleteMapping("/calls")
     public ResponseEntity<ApiResponse<Void>> deleteCallLogs(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        log.info("Delete call logs request for device {} (Google Sheets — manual deletion required)", deviceId);
+        googleSheetsService.deleteCallLogs(deviceId);
         return ResponseEntity.ok(ApiResponse.ok());
     }
 
