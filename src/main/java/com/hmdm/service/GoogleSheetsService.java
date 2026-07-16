@@ -490,10 +490,15 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Get counts for dashboard — PostgreSQL ONLY (fast COUNT queries, no external API calls).
+     * Get counts for dashboard — PostgreSQL FIRST (fast COUNT queries), Sheets fallback.
      * 
-     * REDUCED SERVER LOAD: PostgreSQL COUNT is instant (milliseconds) vs reading
-     * all rows from Google Sheets API (seconds + rate limits).
+     * REDUCED SERVER LOAD:
+     * - Call logs: PostgreSQL COUNT only (always saved to DB, instant).
+     * - Contacts: PostgreSQL first, Sheets fallback (contacts are Sheets-only in production).
+     * - Notifications: PostgreSQL first, Sheets fallback.
+     * 
+     * The Sheets fallback for contacts/notifications is necessary because those
+     * are stored EXCLUSIVELY in Google Sheets to reduce DB write load.
      */
     public Map<String, Long> getCounts(Long deviceId) {
         Map<String, Long> counts = new LinkedHashMap<>();
@@ -502,18 +507,66 @@ public class GoogleSheetsService {
         counts.put("notifications", 0L);
 
         try {
-            // PostgreSQL ONLY — fast COUNT queries, no external API calls
-            counts.put("contacts", contactRepository.countByDeviceId(deviceId));
+            // Call logs: PostgreSQL ONLY (always saved to DB — instant COUNT query)
             counts.put("callLogs", callLogRepository.countByDeviceId(deviceId));
-            counts.put("notifications", notificationRepository.countByDeviceId(deviceId));
 
-            log.debug("Counts: all from PostgreSQL for device {} (contacts={}, callLogs={}, notifications={})",
+            // Contacts: PostgreSQL first, fall back to Sheets
+            // (contacts are Sheets-only in normal production flow to reduce DB writes)
+            Long contactCount = contactRepository.countByDeviceId(deviceId);
+            if (contactCount > 0) {
+                counts.put("contacts", contactCount);
+            } else if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
+                // Fall back to counting from Sheets (cached missing-sheet check avoids 400 errors)
+                counts.put("contacts", getCountFromSheets(deviceId, SHEET_CONTACTS, COL_DEVICE_ID));
+            }
+
+            // Notifications: PostgreSQL first, Sheets fallback
+            Long notifCount = notificationRepository.countByDeviceId(deviceId);
+            if (notifCount > 0) {
+                counts.put("notifications", notifCount);
+            } else if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
+                counts.put("notifications", getCountFromSheets(deviceId, SHEET_NOTIFICATIONS, NOTIF_COL_DEVICE_ID));
+            }
+
+            log.debug("Counts: device {} (contacts={}, callLogs={}, notifications={})",
                     deviceId, counts.get("contacts"), counts.get("callLogs"), counts.get("notifications"));
         } catch (Exception e) {
             log.error("Counts: error: {}", e.getMessage());
         }
 
         return counts;
+    }
+
+    /**
+     * Count rows in a Google Sheet for a specific device ID.
+     * Uses the cached missing-sheet check to avoid unnecessary API calls.
+     */
+    private long getCountFromSheets(Long deviceId, String sheetName, int deviceIdCol) {
+        if (isSheetMissing(sheetName)) return 0L;
+        try {
+            String range = sheetName + "!A:G";
+            List<List<Object>> rows;
+            try {
+                rows = readRange(range);
+            } catch (Exception e) {
+                if (isRangeParseError(e)) markSheetMissing(sheetName);
+                return 0L;
+            }
+            if (rows == null || rows.size() <= 1) return 0L;
+
+            String deviceIdStr = String.valueOf(deviceId);
+            long count = 0;
+            for (int i = 1; i < rows.size(); i++) {
+                List<Object> row = rows.get(i);
+                if (!row.isEmpty() && deviceIdStr.equals(getStr(row, deviceIdCol))) {
+                    count++;
+                }
+            }
+            return count;
+        } catch (Exception e) {
+            log.debug("Count from Sheets failed for {}: {}", sheetName, e.getMessage());
+            return 0L;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
