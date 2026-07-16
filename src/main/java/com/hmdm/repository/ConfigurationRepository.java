@@ -11,4 +11,5 @@ import java.util.Optional;
 public interface ConfigurationRepository extends JpaRepository<Configuration, Long> {
     List<Configuration> findByCustomerId(Long customerId);
     Optional<Configuration> findByCustomerIdAndName(Long customerId, String name);
+    long countByCustomerId(Long customerId);
 }

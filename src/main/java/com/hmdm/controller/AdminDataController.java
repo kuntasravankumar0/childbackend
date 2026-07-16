@@ -118,7 +118,7 @@ public class AdminDataController {
         return ResponseEntity.ok(ApiResponse.ok());
     }
 
-    // ─── Notifications (from Google Sheets, fallback to PostgreSQL) ───
+    // ─── Notifications (from PostgreSQL with pagination, Sheets fallback) ───
 
     @GetMapping("/notifications")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getNotifications(
@@ -127,7 +127,32 @@ public class AdminDataController {
             @RequestParam(defaultValue = "100") int size) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
 
-        // 1. Try Google Sheets first
+        // 1. Use paginated PostgreSQL query (fast, memory-efficient)
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "receivedAt"));
+        Page<DeviceNotification> notifPage = notificationRepository.findByDeviceIdOrderByReceivedAtDesc(deviceId, pageRequest);
+        
+        if (notifPage.hasContent()) {
+            List<Map<String, Object>> items = notifPage.getContent().stream().map(n -> {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("id", n.getId());
+                m.put("deviceId", n.getDeviceId());
+                m.put("packageName", n.getPackageName());
+                m.put("appName", n.getAppName());
+                m.put("title", n.getTitle());
+                m.put("text", n.getText());
+                m.put("receivedAt", n.getReceivedAt());
+                return m;
+            }).collect(Collectors.toList());
+            
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("items", items);
+            result.put("total", notifPage.getTotalElements());
+            result.put("page", page);
+            result.put("pages", notifPage.getTotalPages());
+            return ResponseEntity.ok(ApiResponse.ok(result));
+        }
+
+        // 2. Fall back to Google Sheets (legacy data only)
         List<Map<String, Object>> fromSheets = googleSheetsService.getNotifications(deviceId);
         if (!fromSheets.isEmpty()) {
             int total = fromSheets.size();
@@ -137,34 +162,17 @@ public class AdminDataController {
             
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("items", paged);
-            result.put("total", total);
+            result.put("total", (long) total);
             result.put("page", page);
             result.put("pages", (int) Math.ceil((double) total / size));
             return ResponseEntity.ok(ApiResponse.ok(result));
         }
 
-        // 2. Fall back to PostgreSQL (legacy data)
-        List<DeviceNotification> dbNotifs = notificationRepository.findByDeviceIdOrderByReceivedAtDesc(deviceId);
-        int total = dbNotifs.size();
-        int from = page * size;
-        int to = Math.min(from + size, total);
-        List<Map<String, Object>> items = dbNotifs.subList(Math.min(from, total), to).stream().map(n -> {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("id", n.getId());
-            m.put("deviceId", n.getDeviceId());
-            m.put("packageName", n.getPackageName());
-            m.put("appName", n.getAppName());
-            m.put("title", n.getTitle());
-            m.put("text", n.getText());
-            m.put("receivedAt", n.getReceivedAt());
-            return m;
-        }).collect(Collectors.toList());
-        
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("items", items);
-        result.put("total", (long) total);
+        result.put("items", List.of());
+        result.put("total", 0L);
         result.put("page", page);
-        result.put("pages", (int) Math.ceil((double) total / size));
+        result.put("pages", 0);
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
@@ -175,18 +183,14 @@ public class AdminDataController {
         return ResponseEntity.ok(ApiResponse.ok());
     }
 
-    // ─── Dashboard counts ────────────────────────────────────────────
+    // ─── Dashboard counts (from GoogleSheetsService — includes PostgreSQL fallback) ───
 
     @GetMapping("/counts")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getCounts(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
+        // GoogleSheetsService.getCounts() already handles PostgreSQL fallback
         Map<String, Object> counts = new LinkedHashMap<>();
         counts.putAll(googleSheetsService.getCounts(deviceId));
-        // If Sheets had no data, fall back to PostgreSQL for notifications count
-        if (counts.getOrDefault("notifications", 0L) instanceof Number n && n.longValue() == 0L) {
-            long dbCount = notificationRepository.countByDeviceId(deviceId);
-            if (dbCount > 0) counts.put("notifications", dbCount);
-        }
         return ResponseEntity.ok(ApiResponse.ok(counts));
     }
 }

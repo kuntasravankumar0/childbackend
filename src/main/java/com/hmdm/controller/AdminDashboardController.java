@@ -31,7 +31,7 @@ public class AdminDashboardController {
         long offlineDevices= deviceRepository.countByCustomerIdAndStatus(1L, "OFFLINE");
         long pendingDevices= deviceRepository.countByCustomerIdAndStatus(1L, "PENDING");
         long resetDevices  = deviceRepository.countByCustomerIdAndStatus(1L, "RESET");
-        long totalConfigs  = configurationRepository.findByCustomerId(1L).size();
+        long totalConfigs  = configurationRepository.countByCustomerId(1L);
         long pendingMsgs   = pushMessageRepository.count();
 
         Map<String, Object> result = new LinkedHashMap<>();
