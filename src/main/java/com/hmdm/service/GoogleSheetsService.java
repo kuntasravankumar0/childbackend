@@ -20,11 +20,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.time.Instant;
-import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -32,12 +34,18 @@ import java.util.*;
 /**
  * Service for syncing device contacts and call logs to Google Sheets.
  *
- * Uses a Google Service Account (GOOGLE_SHEETS_CREDENTIALS env var) or
- * falls back to API key for read-only access.
+ * DATA FLOW (Production with API key):
+ *   Android APK → Apps Script Web App → Google Sheets (WRITE)
+ *   Backend Admin API → Google Sheets API Key → Google Sheets (READ)
+ *   PostgreSQL = read-only fallback for legacy data only.
+ *
+ * DATA FLOW (Service account available):
+ *   Backend writes directly to Sheets + PostgreSQL backup.
  *
  * Required environment variables:
- *   GOOGLE_SHEETS_CREDENTIALS — JSON string of the service account key
  *   GOOGLE_SHEETS_SPREADSHEET_ID — The spreadsheet ID from the sheet URL
+ *   GOOGLE_SHEETS_API_KEY       — API key for read-only access
+ *   GOOGLE_SHEETS_CREDENTIALS   — (optional) Service account JSON for write access
  */
 @Service
 @Slf4j
@@ -54,7 +62,7 @@ public class GoogleSheetsService {
     private static final String CALL_LOGS_RANGE = SHEET_CALL_LOGS + "!A:G";
     private static final String NOTIFICATIONS_RANGE = SHEET_NOTIFICATIONS + "!A:G";
 
-    // Column indices (0-based)
+    // Contacts column indices (0-based)
     private static final int COL_DEVICE_ID = 0;
     private static final int COL_RAW_CONTACT_ID = 1;
     private static final int COL_NAME = 2;
@@ -63,6 +71,7 @@ public class GoogleSheetsService {
     private static final int COL_EMAIL = 5;
     private static final int COL_TIMESTAMP = 6;
 
+    // Call logs column indices (0-based)
     private static final int CALL_COL_DEVICE_ID = 0;
     private static final int CALL_COL_PHONE_NUMBER = 1;
     private static final int CALL_COL_CALL_TYPE = 2;
@@ -88,6 +97,9 @@ public class GoogleSheetsService {
 
     @Value("${google.sheets.api-key:}")
     private String apiKey;
+
+    @Value("${google.sheets.webapp-url:}")
+    private String webappUrl;
 
     @Autowired
     private DeviceContactRepository contactRepository;
@@ -115,7 +127,7 @@ public class GoogleSheetsService {
                 sheetsService = createSheetsService(credentials);
                 initialized = true;
                 log.info("GoogleSheetsService: initialized with service account (read/write to Sheets)");
-                log.info("GoogleSheetsService: contacts & call logs will also sync to PostgreSQL");
+                log.info("GoogleSheetsService: contacts & call logs synced to Sheets + PostgreSQL backup");
                 return;
             } catch (Exception e) {
                 log.warn("GoogleSheetsService: GOOGLE_SHEETS_CREDENTIALS present but invalid (not a valid JSON service account key). " +
@@ -124,15 +136,15 @@ public class GoogleSheetsService {
             }
         }
 
-        // Fall back to API key (read-only Sheets) + PostgreSQL for writes
+        // Fall back to API key (read-only Sheets)
         if (apiKey != null && !apiKey.isBlank()) {
             try {
                 useApiKey = true;
                 sheetsService = createSheetsService(null);
                 initialized = true;
-                log.info("GoogleSheetsService: initialized with API key — " +
-                        "Google Sheets is READ-ONLY. Contacts & call logs " +
-                        "will be stored in PostgreSQL instead.");
+                log.info("GoogleSheetsService: initialized with API key — Google Sheets is READ-ONLY. " +
+                        "Contacts & call logs written by APK → Apps Script → Sheets. " +
+                        "Backend reads from Sheets via API key. PostgreSQL is fallback.");
                 return;
             } catch (Exception e) {
                 log.warn("GoogleSheetsService: API key initialization failed: {}. Fallback to DB-only.", e.getMessage());
@@ -144,11 +156,6 @@ public class GoogleSheetsService {
         log.info("GoogleSheetsService: no valid Google credentials — " +
                 "contacts & call logs stored in PostgreSQL only");
     }
-
-    /**
-     * Test if we can write to the sheet. Logs a warning if we can't.
-     */
-
 
     private Sheets createSheetsService(GoogleCredentials credentials) throws GeneralSecurityException, IOException {
         var httpTransport = GoogleNetHttpTransport.newTrustedTransport();
@@ -167,79 +174,65 @@ public class GoogleSheetsService {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  CONTACTS  (PostgreSQL primary, Google Sheets optional)
+    //  CONTACTS  (Google Sheets primary, PostgreSQL read-only fallback)
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Upsert contacts into PostgreSQL (primary) + Google Sheets (if service account available).
-     * Dedup by deviceId + rawContactId.
+     * Sync contacts — Google Sheets is primary, PostgreSQL is reliable fallback.
+     *
+     * Always saves to PostgreSQL regardless of auth mode.
+     * The useApiKey flag only controls whether the backend also writes to Sheets
+     * directly (service account mode) or reads-only via API key.
      */
     public int syncContacts(Long deviceId, List<Map<String, Object>> contacts) {
         if (!initialized) return 0;
 
         try {
-            // Always save to PostgreSQL
-            int dbSaved = 0;
-            for (Map<String, Object> contact : contacts) {
-                String rawContactId = getStr(contact, "rawContactId");
-                String name = getStr(contact, "name");
-                String phone = getStr(contact, "phone");
-                String phoneType = getStr(contact, "phoneType");
-                String email = getStr(contact, "email");
-
-                // Dedup check: find by deviceId + rawContactId
-                var existing = contactRepository.findByDeviceIdAndRawContactId(deviceId, rawContactId);
-                if (existing.isPresent()) {
-                    DeviceContact dc = existing.get();
-                    dc.setName(name);
-                    dc.setPhone(phone);
-                    dc.setPhoneType(phoneType);
-                    dc.setEmail(email);
-                    contactRepository.save(dc);
-                } else {
-                    contactRepository.save(DeviceContact.builder()
-                            .deviceId(deviceId)
-                            .rawContactId(rawContactId)
-                            .name(name)
-                            .phone(phone)
-                            .phoneType(phoneType)
-                            .email(email)
-                            .build());
-                }
-                dbSaved++;
-            }
-
-            // Also sync to Google Sheets if we have a service account (write access)
+            // 1. Service account available — write directly to Sheets + PostgreSQL backup
             if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
-                try {
-                    syncContactsToSheets(deviceId, contacts);
-                } catch (Exception e) {
-                    log.warn("GoogleSheets: sheets sync failed (this is ok — data is in DB): {}", e.getMessage());
-                }
+                syncContactsToSheets(deviceId, contacts);
+                log.info("Contacts: synced {} to Google Sheets for device {}", contacts.size(), deviceId);
+            } else {
+                log.info("Contacts: API key mode — data written by APK directly. Skipping Sheets write.");
             }
 
+            // 2. ALWAYS save to PostgreSQL (reliable storage for web UI)
+            int dbSaved = saveContactsToDb(deviceId, contacts);
             if (dbSaved > 0) {
                 log.info("Contacts: saved {} to PostgreSQL for device {}", dbSaved, deviceId);
             }
-            return dbSaved;
+
+            // 3. ALSO try to write to Google Sheets via Apps Script Web App (fallback)
+            if (webappUrl != null && !webappUrl.isBlank()) {
+                try {
+                    Map<String, Object> sheetsPayload = new LinkedHashMap<>();
+                    sheetsPayload.put("action", "syncAll");
+                    sheetsPayload.put("deviceId", String.valueOf(deviceId));
+                    sheetsPayload.put("contacts", contacts);
+                    sendToWebApp(sheetsPayload);
+                    log.info("Contacts: sent {} to Google Sheets via web app fallback", contacts.size());
+                } catch (Exception we) {
+                    log.warn("Contacts: web app fallback failed: {}", we.getMessage());
+                }
+            }
+
+            return contacts.size();
+
         } catch (Exception e) {
-            log.error("Contacts: DB sync error: {}", e.getMessage());
+            log.error("Contacts: sync error: {}", e.getMessage());
             return 0;
         }
     }
 
     /**
-     * Read contacts for a specific device — prefers Google Sheets (primary storage),
-     * falls back to PostgreSQL (legacy data).
-     * Data is now written directly to Google Sheets by the Android APK via the
-     * Apps Script web app, so Sheets is the primary read source.
+     * Read contacts for a device — Google Sheets first, PostgreSQL fallback.
      */
     public List<Map<String, Object>> getContacts(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            // 1. Try Google Sheets first (primary storage for new data)
+            // 1. Try Google Sheets first (primary storage)
             if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
                 try {
                     List<Map<String, Object>> sheetsResult = getContactsFromSheets(deviceId);
@@ -253,7 +246,7 @@ public class GoogleSheetsService {
                 }
             }
 
-            // 2. Fall back to PostgreSQL (legacy data from before Sheets migration)
+            // 2. Fall back to PostgreSQL (legacy data)
             List<DeviceContact> dbContacts = contactRepository.findByDeviceId(deviceId);
             for (DeviceContact dc : dbContacts) {
                 Map<String, Object> contact = new LinkedHashMap<>();
@@ -276,91 +269,88 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Delete all contacts for a device from PostgreSQL.
+     * Delete all contacts for a device from both Sheets and PostgreSQL.
      */
     public void deleteContacts(Long deviceId) {
         if (!initialized) return;
         try {
+            // Try to delete from Sheets if service account available
+            if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
+                try {
+                    deleteContactsFromSheets(deviceId);
+                    log.info("Contacts: deleted from Google Sheets for device {}", deviceId);
+                } catch (Exception e) {
+                    log.warn("Contacts: Sheets delete failed: {}", e.getMessage());
+                }
+            }
+            // Also clean up PostgreSQL
             contactRepository.deleteByDeviceId(deviceId);
-            log.info("Contacts: deleted all for device {}", deviceId);
+            log.info("Contacts: deleted all for device {} from PostgreSQL", deviceId);
         } catch (Exception e) {
             log.error("Contacts: delete error: {}", e.getMessage());
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  CALL LOGS  (PostgreSQL primary, Google Sheets optional)
+    //  CALL LOGS  (Google Sheets primary, PostgreSQL read-only fallback)
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Upsert call logs into PostgreSQL (primary) + Google Sheets (if service account available).
-     * Dedup by deviceId + phoneNumber + callDate + callType + contactName.
+     * Sync call logs — Google Sheets is primary, PostgreSQL is reliable fallback.
+     *
+     * Always saves to PostgreSQL regardless of auth mode.
+     * The useApiKey flag only controls whether the backend also writes to Sheets
+     * directly (service account mode) or reads-only via API key.
      */
     public int syncCallLogs(Long deviceId, List<Map<String, Object>> callLogs) {
         if (!initialized) return 0;
 
         try {
-            int saved = 0;
-            int skipped = 0;
-
-            for (Map<String, Object> call : callLogs) {
-                String phoneNumber = getStr(call, "phoneNumber");
-                String callType = getStr(call, "callType");
-                Long callDate = parseLong(getStr(call, "callDate"));
-                Integer durationSec = parseInt(String.valueOf(call.getOrDefault("durationSec", 0)));
-                String contactName = getStr(call, "contactName");
-
-                // Dedup check via repository
-                boolean exists = callLogRepository.existsByDeviceIdAndPhoneNumberAndCallDateAndCallTypeAndContactName(
-                        deviceId, phoneNumber, callDate, callType, contactName);
-                if (exists) {
-                    skipped++;
-                    continue;
-                }
-
-                callLogRepository.save(CallLog.builder()
-                        .deviceId(deviceId)
-                        .phoneNumber(phoneNumber)
-                        .callType(callType)
-                        .durationSec(durationSec)
-                        .callDate(callDate)
-                        .contactName(contactName)
-                        .build());
-                saved++;
-            }
-
-            // Also sync to Google Sheets if we have a service account (write access)
+            // 1. Service account available — write directly to Sheets + PostgreSQL backup
             if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
+                syncCallLogsToSheets(deviceId, callLogs);
+                log.info("CallLogs: synced {} to Google Sheets for device {}", callLogs.size(), deviceId);
+            } else {
+                log.info("CallLogs: API key mode — data written by APK directly. Skipping Sheets write.");
+            }
+
+            // 2. ALWAYS save to PostgreSQL (reliable storage for web UI)
+            int saved = saveCallLogsToDb(deviceId, callLogs);
+            if (saved > 0) {
+                log.info("CallLogs: saved {} to PostgreSQL for device {}", saved, deviceId);
+            }
+
+            // 3. ALSO try to write to Google Sheets via Apps Script Web App (fallback)
+            if (webappUrl != null && !webappUrl.isBlank()) {
                 try {
-                    syncCallLogsToSheets(deviceId, callLogs);
-                } catch (Exception e) {
-                    log.warn("GoogleSheets: call log sheets sync failed (data is in DB): {}", e.getMessage());
+                    Map<String, Object> sheetsPayload = new LinkedHashMap<>();
+                    sheetsPayload.put("action", "syncAll");
+                    sheetsPayload.put("deviceId", String.valueOf(deviceId));
+                    sheetsPayload.put("callLogs", callLogs);
+                    sendToWebApp(sheetsPayload);
+                    log.info("CallLogs: sent {} to Google Sheets via web app fallback", callLogs.size());
+                } catch (Exception we) {
+                    log.warn("CallLogs: web app fallback failed: {}", we.getMessage());
                 }
             }
 
-            if (saved > 0 || skipped > 0) {
-                log.info("CallLogs: saved {} to PostgreSQL for device {} (skipped {} dups)",
-                        saved, deviceId, skipped);
-            }
-            return saved;
+            return callLogs.size();
+
         } catch (Exception e) {
-            log.error("CallLogs: DB sync error: {}", e.getMessage());
+            log.error("CallLogs: sync error: {}", e.getMessage());
             return 0;
         }
     }
 
     /**
-     * Read call logs for a specific device — prefers Google Sheets (primary storage),
-     * falls back to PostgreSQL (legacy data).
-     * Data is now written directly to Google Sheets by the Android APK via the
-     * Apps Script web app, so Sheets is the primary read source.
+     * Read call logs for a device — Google Sheets first, PostgreSQL fallback.
      */
     public List<Map<String, Object>> getCallLogs(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            // 1. Try Google Sheets first (primary storage for new data)
+            // 1. Try Google Sheets first (primary storage)
             if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
                 try {
                     List<Map<String, Object>> sheetsResult = getCallLogsFromSheets(deviceId);
@@ -374,7 +364,7 @@ public class GoogleSheetsService {
                 }
             }
 
-            // 2. Fall back to PostgreSQL (legacy data from before Sheets migration)
+            // 2. Fall back to PostgreSQL (legacy data)
             List<CallLog> dbCalls = callLogRepository.findByDeviceIdOrderByCallDateDesc(deviceId);
             for (CallLog cl : dbCalls) {
                 Map<String, Object> call = new LinkedHashMap<>();
@@ -397,13 +387,23 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Delete all call logs for a device from PostgreSQL.
+     * Delete all call logs for a device from both Sheets and PostgreSQL.
      */
     public void deleteCallLogs(Long deviceId) {
         if (!initialized) return;
         try {
+            // Try to delete from Sheets if service account available
+            if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
+                try {
+                    deleteCallLogsFromSheets(deviceId);
+                    log.info("CallLogs: deleted from Google Sheets for device {}", deviceId);
+                } catch (Exception e) {
+                    log.warn("CallLogs: Sheets delete failed: {}", e.getMessage());
+                }
+            }
+            // Also clean up PostgreSQL
             callLogRepository.deleteByDeviceId(deviceId);
-            log.info("CallLogs: deleted all for device {}", deviceId);
+            log.info("CallLogs: deleted all for device {} from PostgreSQL", deviceId);
         } catch (Exception e) {
             log.error("CallLogs: delete error: {}", e.getMessage());
         }
@@ -456,7 +456,6 @@ public class GoogleSheetsService {
             counts.put("callLogs", callLogRepository.countByDeviceId(deviceId));
             log.debug("Counts: read from PostgreSQL for device {} (contacts={}, callLogs={})",
                     deviceId, counts.get("contacts"), counts.get("callLogs"));
-            // Notifications count from DB is handled separately in the controller
         } catch (Exception e) {
             log.error("Counts: error: {}", e.getMessage());
         }
@@ -469,15 +468,15 @@ public class GoogleSheetsService {
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Read notifications for a specific device — prefers Google Sheets (primary),
-     * falls back to PostgreSQL (legacy).
+     * Read notifications for a device — Google Sheets first, empty fallback.
+     * (Controller handles PostgreSQL fallback separately.)
      */
     public List<Map<String, Object>> getNotifications(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            // 1. Try Google Sheets first (primary storage for new data)
+            // Try Google Sheets first
             if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
                 try {
                     List<Map<String, Object>> sheetsResult = getNotificationsFromSheets(deviceId);
@@ -487,12 +486,10 @@ public class GoogleSheetsService {
                         return sheetsResult;
                     }
                 } catch (Exception e) {
-                    log.debug("Notifications: Google Sheets read failed (will try DB): {}", e.getMessage());
+                    log.debug("Notifications: Google Sheets read failed: {}", e.getMessage());
                 }
             }
 
-            // 2. Fall back to PostgreSQL result is empty (legacy data)
-            // The controller handles the DB read since we don't inject NotificationRepository here
             return result;
         } catch (Exception e) {
             log.error("Notifications: read error: {}", e.getMessage());
@@ -501,7 +498,77 @@ public class GoogleSheetsService {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  GOOGLE SHEETS SPECIFIC METHODS (used only with service account)
+    //  POSTGRESQL BACKUP METHODS
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * Save contacts to PostgreSQL as a backup layer.
+     * Dedup by deviceId + rawContactId.
+     */
+    private int saveContactsToDb(Long deviceId, List<Map<String, Object>> contacts) {
+        int dbSaved = 0;
+        for (Map<String, Object> contact : contacts) {
+            String rawContactId = getStr(contact, "rawContactId");
+            String name = getStr(contact, "name");
+            String phone = getStr(contact, "phone");
+            String phoneType = getStr(contact, "phoneType");
+            String email = getStr(contact, "email");
+
+            var existing = contactRepository.findByDeviceIdAndRawContactId(deviceId, rawContactId);
+            if (existing.isPresent()) {
+                DeviceContact dc = existing.get();
+                dc.setName(name);
+                dc.setPhone(phone);
+                dc.setPhoneType(phoneType);
+                dc.setEmail(email);
+                contactRepository.save(dc);
+            } else {
+                contactRepository.save(DeviceContact.builder()
+                        .deviceId(deviceId)
+                        .rawContactId(rawContactId)
+                        .name(name)
+                        .phone(phone)
+                        .phoneType(phoneType)
+                        .email(email)
+                        .build());
+            }
+            dbSaved++;
+        }
+        return dbSaved;
+    }
+
+    /**
+     * Save call logs to PostgreSQL as a backup layer.
+     * Dedup by deviceId + phoneNumber + callDate + callType + contactName.
+     */
+    private int saveCallLogsToDb(Long deviceId, List<Map<String, Object>> callLogs) {
+        int saved = 0;
+        for (Map<String, Object> call : callLogs) {
+            String phoneNumber = getStr(call, "phoneNumber");
+            String callType = getStr(call, "callType");
+            Long callDate = parseLong(getStr(call, "callDate"));
+            Integer durationSec = parseInt(String.valueOf(call.getOrDefault("durationSec", 0)));
+            String contactName = getStr(call, "contactName");
+
+            boolean exists = callLogRepository.existsByDeviceIdAndPhoneNumberAndCallDateAndCallTypeAndContactName(
+                    deviceId, phoneNumber, callDate, callType, contactName);
+            if (exists) continue;
+
+            callLogRepository.save(CallLog.builder()
+                    .deviceId(deviceId)
+                    .phoneNumber(phoneNumber)
+                    .callType(callType)
+                    .durationSec(durationSec)
+                    .callDate(callDate)
+                    .contactName(contactName)
+                    .build());
+            saved++;
+        }
+        return saved;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  GOOGLE SHEETS METHODS
     // ═══════════════════════════════════════════════════════════════════
 
     private void syncContactsToSheets(Long deviceId, List<Map<String, Object>> contacts) throws IOException {
@@ -570,6 +637,28 @@ public class GoogleSheetsService {
             }
         }
         return result;
+    }
+
+    private void deleteContactsFromSheets(Long deviceId) throws IOException {
+        List<List<Object>> rows = readRange(CONTACTS_RANGE);
+        if (rows == null || rows.size() <= 1) return;
+
+        String deviceIdStr = String.valueOf(deviceId);
+        List<Integer> rowsToDelete = new ArrayList<>();
+        for (int i = 1; i < rows.size(); i++) {
+            List<Object> row = rows.get(i);
+            if (!row.isEmpty() && deviceIdStr.equals(getStr(row, COL_DEVICE_ID))) {
+                rowsToDelete.add(i);
+            }
+        }
+
+        // Delete in reverse order to keep indices valid
+        Collections.sort(rowsToDelete, Collections.reverseOrder());
+        for (int rowIndex : rowsToDelete) {
+            // Clear the row contents instead of deleting (Google Sheets API limitation)
+            String range = SHEET_CONTACTS + "!A" + (rowIndex + 1) + ":G" + (rowIndex + 1);
+            updateRange(range, Collections.singletonList(Arrays.asList("", "", "", "", "", "", "")));
+        }
     }
 
     private void syncCallLogsToSheets(Long deviceId, List<Map<String, Object>> callLogs) throws IOException {
@@ -642,6 +731,26 @@ public class GoogleSheetsService {
             }
         }
         return result;
+    }
+
+    private void deleteCallLogsFromSheets(Long deviceId) throws IOException {
+        List<List<Object>> rows = readRange(CALL_LOGS_RANGE);
+        if (rows == null || rows.size() <= 1) return;
+
+        String deviceIdStr = String.valueOf(deviceId);
+        List<Integer> rowsToDelete = new ArrayList<>();
+        for (int i = 1; i < rows.size(); i++) {
+            List<Object> row = rows.get(i);
+            if (!row.isEmpty() && deviceIdStr.equals(getStr(row, CALL_COL_DEVICE_ID))) {
+                rowsToDelete.add(i);
+            }
+        }
+
+        Collections.sort(rowsToDelete, Collections.reverseOrder());
+        for (int rowIndex : rowsToDelete) {
+            String range = SHEET_CALL_LOGS + "!A" + (rowIndex + 1) + ":G" + (rowIndex + 1);
+            updateRange(range, Collections.singletonList(Arrays.asList("", "", "", "", "", "", "")));
+        }
     }
 
     private List<Map<String, Object>> getNotificationsFromSheets(Long deviceId) throws IOException {
@@ -776,5 +885,40 @@ public class GoogleSheetsService {
     private String timestampNow() {
         return DateTimeFormatter.ISO_LOCAL_DATE_TIME.withZone(ZoneId.systemDefault())
                 .format(Instant.now());
+    }
+
+    /**
+     * Fallback: POST data to the Google Sheets Apps Script Web App.
+     * This is the same endpoint the Android APK uses.
+     * The Web App has authorization to write to the sheet.
+     */
+    private void sendToWebApp(Map<String, Object> payload) throws IOException {
+        if (webappUrl == null || webappUrl.isBlank()) return;
+
+        String json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(payload);
+
+        URL url = URI.create(webappUrl).toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        try {
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(30000);
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(json.getBytes(StandardCharsets.UTF_8));
+                os.flush();
+            }
+
+            int code = conn.getResponseCode();
+            if (code >= 200 && code < 300) {
+                log.debug("WebApp: POST OK ({} bytes sent)", json.length());
+            } else {
+                log.warn("WebApp: POST returned HTTP {} for URL {}", code, webappUrl);
+            }
+        } finally {
+            conn.disconnect();
+        }
     }
 }
