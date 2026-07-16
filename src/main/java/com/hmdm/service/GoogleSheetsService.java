@@ -347,46 +347,56 @@ public class GoogleSheetsService {
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Sync call logs — Google Sheets ONLY (reduces DB server load).
+     * Sync call logs — ALWAYS save to PostgreSQL (primary read source for 50K+ logs) + Sheets (backup).
      *
-     * Call logs are stored EXCLUSIVELY in Google Sheets to reduce DB write load.
-     * PostgreSQL is only used as READ fallback when Sheets is unavailable.
+     * With 50,000+ call logs per device, Google Sheets cannot handle efficient reads.
+     * PostgreSQL is the PRIMARY read source with pagination support.
+     * Google Sheets remains as backup/sync target.
      */
     public int syncCallLogs(Long deviceId, List<Map<String, Object>> callLogs) {
         if (!initialized) return 0;
 
         try {
-            // 1. Try writing to Google Sheets directly (service account mode)
-            boolean sheetsWritten = false;
+            // 1. ALWAYS save to PostgreSQL (primary read source for paginated queries)
+            // PostgreSQL can efficiently query 50K+ records with LIMIT/OFFSET + search
+            int saved = saveCallLogsToDb(deviceId, callLogs);
+            if (saved > 0) {
+                log.info("CallLogs: saved {} to PostgreSQL for device {} (primary storage)", saved, deviceId);
+            }
+
+            // 2. Try writing to Google Sheets (backup)
             if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
-                syncCallLogsToSheets(deviceId, callLogs);
-                sheetsWritten = true;
-                log.info("CallLogs: synced {} to Google Sheets for device {}", callLogs.size(), deviceId);
-            }
-
-            // 2. Fallback: write via Apps Script Web App (API key mode)
-            if (!sheetsWritten && webappUrl != null && !webappUrl.isBlank()) {
-                try {
-                    Map<String, Object> sheetsPayload = new LinkedHashMap<>();
-                    sheetsPayload.put("action", "syncAll");
-                    sheetsPayload.put("deviceId", String.valueOf(deviceId));
-                    sheetsPayload.put("callLogs", callLogs);
-                    sendToWebApp(sheetsPayload);
-                    sheetsWritten = true;
-                    log.info("CallLogs: sent {} to Google Sheets via web app fallback", callLogs.size());
-                } catch (Exception we) {
-                    log.warn("CallLogs: web app fallback failed: {}", we.getMessage());
+                // Batch write in chunks of 500 to avoid Sheets API limits
+                int batchSize = 500;
+                for (int i = 0; i < callLogs.size(); i += batchSize) {
+                    int end = Math.min(i + batchSize, callLogs.size());
+                    List<Map<String, Object>> batch = callLogs.subList(i, end);
+                    try {
+                        syncCallLogsToSheets(deviceId, batch);
+                        log.debug("CallLogs: synced batch {}-{} to Sheets", i, end);
+                    } catch (Exception e) {
+                        log.warn("CallLogs: Sheets batch {}-{} failed: {}", i, end, e.getMessage());
+                    }
                 }
             }
 
-            // 3. ONLY save to PostgreSQL if ALL Sheets paths failed (reduces DB load)
-            if (!sheetsWritten) {
-                int saved = saveCallLogsToDb(deviceId, callLogs);
-                if (saved > 0) {
-                    log.info("CallLogs: saved {} to PostgreSQL (Sheets unavailable)", saved);
+            // 3. Fallback: write via Apps Script Web App (batched)
+            if (webappUrl != null && !webappUrl.isBlank()) {
+                int batchSize = 500;
+                for (int i = 0; i < callLogs.size(); i += batchSize) {
+                    int end = Math.min(i + batchSize, callLogs.size());
+                    List<Map<String, Object>> batch = callLogs.subList(i, end);
+                    try {
+                        Map<String, Object> sheetsPayload = new LinkedHashMap<>();
+                        sheetsPayload.put("action", "syncAll");
+                        sheetsPayload.put("deviceId", String.valueOf(deviceId));
+                        sheetsPayload.put("callLogs", batch);
+                        sendToWebApp(sheetsPayload);
+                        log.debug("CallLogs: webapp batch {}-{} OK", i, end);
+                    } catch (Exception we) {
+                        log.warn("CallLogs: webapp batch {}-{} failed: {}", i, end, we.getMessage());
+                    }
                 }
-            } else {
-                log.debug("CallLogs: NOT saving to PostgreSQL — Sheets only (reduced DB load)");
             }
 
             return callLogs.size();
@@ -398,40 +408,46 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Read call logs for a device — Google Sheets first, PostgreSQL fallback.
+     * Read call logs for a device — PostgreSQL FIRST (efficient paginated reads for 50K+ logs).
+     * Google Sheets is fallback for legacy data only.
      */
     public List<Map<String, Object>> getCallLogs(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            // 1. Try Google Sheets first (primary storage)
+            // 1. PostgreSQL is PRIMARY read source (supports pagination, search, filtering)
+            // Only fetches all for legacy compatibility — controllers should use paginated methods
+            List<CallLog> dbCalls = callLogRepository.findByDeviceIdOrderByCallDateDesc(deviceId);
+            if (!dbCalls.isEmpty()) {
+                for (CallLog cl : dbCalls) {
+                    Map<String, Object> call = new LinkedHashMap<>();
+                    call.put("id", cl.getId());
+                    call.put("deviceId", cl.getDeviceId());
+                    call.put("phoneNumber", cl.getPhoneNumber());
+                    call.put("callType", cl.getCallType());
+                    call.put("durationSec", cl.getDurationSec());
+                    call.put("callDate", cl.getCallDate());
+                    call.put("contactName", cl.getContactName());
+                    call.put("syncedAt", cl.getCreatedAt() != null ? cl.getCreatedAt().toString() : "");
+                    result.add(call);
+                }
+                log.debug("CallLogs: read {} from PostgreSQL for device {}", result.size(), deviceId);
+                return result;
+            }
+
+            // 2. Fall back to Google Sheets (legacy data only — will be deprecated)
             if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
                 try {
                     List<Map<String, Object>> sheetsResult = getCallLogsFromSheets(deviceId);
                     if (!sheetsResult.isEmpty()) {
-                        log.debug("CallLogs: read {} from Google Sheets for device {}",
+                        log.debug("CallLogs: read {} from Google Sheets for device {} (legacy)",
                                 sheetsResult.size(), deviceId);
                         return sheetsResult;
                     }
                 } catch (Exception e) {
-                    log.debug("CallLogs: Google Sheets read failed (will try DB): {}", e.getMessage());
+                    log.debug("CallLogs: Google Sheets read failed: {}", e.getMessage());
                 }
-            }
-
-            // 2. Fall back to PostgreSQL (legacy data)
-            List<CallLog> dbCalls = callLogRepository.findByDeviceIdOrderByCallDateDesc(deviceId);
-            for (CallLog cl : dbCalls) {
-                Map<String, Object> call = new LinkedHashMap<>();
-                call.put("id", cl.getId());
-                call.put("deviceId", cl.getDeviceId());
-                call.put("phoneNumber", cl.getPhoneNumber());
-                call.put("callType", cl.getCallType());
-                call.put("durationSec", cl.getDurationSec());
-                call.put("callDate", cl.getCallDate());
-                call.put("contactName", cl.getContactName());
-                call.put("syncedAt", cl.getCreatedAt() != null ? cl.getCreatedAt().toString() : "");
-                result.add(call);
             }
 
             return result;
@@ -465,8 +481,8 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Get counts for dashboard — reads from Google Sheets (primary),
-     * falls back to PostgreSQL (legacy, reduced DB load — only used when Sheets is empty).
+     * Get counts for dashboard — uses PostgreSQL for call logs (efficient for 50K+),
+     * Google Sheets for contacts (faster for 1000+ across devices).
      */
     public Map<String, Long> getCounts(Long deviceId) {
         Map<String, Long> counts = new LinkedHashMap<>();
@@ -475,20 +491,17 @@ public class GoogleSheetsService {
         counts.put("notifications", 0L);
 
         try {
-            // 1. Try Google Sheets first (primary storage)
+            // 1. PostgreSQL for call logs count (efficient COUNT query for 50K+ records)
+            counts.put("callLogs", callLogRepository.countByDeviceId(deviceId));
+
+            // 2. Google Sheets for contacts count (still manageable at 1000+ per device)
             if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
                 try {
                     List<Map<String, Object>> contactsFromSheets = getContactsFromSheets(deviceId);
                     counts.put("contacts", (long) contactsFromSheets.size());
                 } catch (Exception e) {
-                    log.debug("Counts: Sheets contacts count failed: {}", e.getMessage());
-                }
-
-                try {
-                    List<Map<String, Object>> callsFromSheets = getCallLogsFromSheets(deviceId);
-                    counts.put("callLogs", (long) callsFromSheets.size());
-                } catch (Exception e) {
-                    log.debug("Counts: Sheets call logs count failed: {}", e.getMessage());
+                    log.debug("Counts: Sheets contacts count failed, using DB: {}", e.getMessage());
+                    counts.put("contacts", contactRepository.countByDeviceId(deviceId));
                 }
 
                 try {
@@ -497,20 +510,13 @@ public class GoogleSheetsService {
                 } catch (Exception e) {
                     log.debug("Counts: Sheets notifications count failed: {}", e.getMessage());
                 }
-
-                // If Sheets returned any data, use it (don't fall back to DB)
-                if (counts.get("contacts") > 0 || counts.get("callLogs") > 0 || counts.get("notifications") > 0) {
-                    log.debug("Counts: read from Google Sheets for device {} (contacts={}, callLogs={}, notifications={})",
-                            deviceId, counts.get("contacts"), counts.get("callLogs"), counts.get("notifications"));
-                    return counts;
-                }
+            } else {
+                // No Sheets configured — use DB for contacts too
+                counts.put("contacts", contactRepository.countByDeviceId(deviceId));
             }
 
-            // 2. Fall back to PostgreSQL (legacy data — only used when Sheets is empty)
-            counts.put("contacts", contactRepository.countByDeviceId(deviceId));
-            counts.put("callLogs", callLogRepository.countByDeviceId(deviceId));
-            log.debug("Counts: read from PostgreSQL for device {} (contacts={}, callLogs={})",
-                    deviceId, counts.get("contacts"), counts.get("callLogs"));
+            log.debug("Counts: PostgreSQL callLogs={}, Sheets contacts={}, notifications={}",
+                    counts.get("callLogs"), counts.get("contacts"), counts.get("notifications"));
         } catch (Exception e) {
             log.error("Counts: error: {}", e.getMessage());
         }

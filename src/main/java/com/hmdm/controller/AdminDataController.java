@@ -1,12 +1,17 @@
 package com.hmdm.controller;
 
 import com.hmdm.dto.ApiResponse;
+import com.hmdm.entity.CallLog;
 import com.hmdm.entity.DeviceNotification;
+import com.hmdm.repository.CallLogRepository;
 import com.hmdm.repository.DeviceNotificationRepository;
 import com.hmdm.repository.DeviceRepository;
 import com.hmdm.service.GoogleSheetsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
@@ -14,6 +19,7 @@ import org.springframework.web.bind.annotation.*;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/devices/{deviceId}/data")
@@ -24,15 +30,33 @@ public class AdminDataController {
 
     private final DeviceRepository deviceRepository;
     private final DeviceNotificationRepository notificationRepository;
+    private final CallLogRepository callLogRepository;
     private final GoogleSheetsService googleSheetsService;
 
-    // ─── Contacts (from Google Sheets) ────────────────────────────────
+    // ─── Contacts (from Google Sheets, paginated) ─────────────────────
 
     @GetMapping("/contacts")
-    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getContacts(@PathVariable Long deviceId) {
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getContacts(
+            @PathVariable Long deviceId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "200") int size) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        List<Map<String, Object>> contacts = googleSheetsService.getContacts(deviceId);
-        return ResponseEntity.ok(ApiResponse.ok(contacts));
+        
+        List<Map<String, Object>> allContacts = googleSheetsService.getContacts(deviceId);
+        
+        // Paginate in-memory (1000+ contacts is manageable)
+        int total = allContacts.size();
+        int from = page * size;
+        int to = Math.min(from + size, total);
+        List<Map<String, Object>> paged = from >= total ? List.of() : allContacts.subList(from, to);
+        
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("items", paged);
+        result.put("total", total);
+        result.put("page", page);
+        result.put("pages", (int) Math.ceil((double) total / size));
+        
+        return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
     @DeleteMapping("/contacts")
@@ -42,13 +66,49 @@ public class AdminDataController {
         return ResponseEntity.ok(ApiResponse.ok());
     }
 
-    // ─── Call Logs (from Google Sheets) ───────────────────────────────
+    // ─── Call Logs (from PostgreSQL with pagination + server-side search) ─
 
     @GetMapping("/calls")
-    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getCallLogs(@PathVariable Long deviceId) {
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getCallLogs(
+            @PathVariable Long deviceId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size,
+            @RequestParam(required = false) String search,
+            @RequestParam(required = false) String type,
+            @RequestParam(required = false) Long dateFrom,
+            @RequestParam(required = false) Long dateTo) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        List<Map<String, Object>> calls = googleSheetsService.getCallLogs(deviceId);
-        return ResponseEntity.ok(ApiResponse.ok(calls));
+        
+        // Use paginated DB query for efficient 50K+ call log handling
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "callDate"));
+        
+        Page<CallLog> callLogPage = callLogRepository.searchByDeviceId(
+                deviceId, search, type, dateFrom, dateTo, pageRequest);
+        
+        List<Map<String, Object>> items = callLogPage.getContent().stream().map(cl -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", cl.getId());
+            m.put("deviceId", cl.getDeviceId());
+            m.put("phoneNumber", cl.getPhoneNumber());
+            m.put("callType", cl.getCallType());
+            m.put("durationSec", cl.getDurationSec());
+            m.put("callDate", cl.getCallDate());
+            m.put("contactName", cl.getContactName());
+            m.put("syncedAt", cl.getCreatedAt() != null ? cl.getCreatedAt().toString() : "");
+            return m;
+        }).collect(Collectors.toList());
+        
+        long totalFiltered = callLogPage.getTotalElements();
+        
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("items", items);
+        result.put("total", totalFiltered);
+        result.put("page", page);
+        result.put("pages", callLogPage.getTotalPages());
+        result.put("search", search);
+        result.put("type", type);
+        
+        return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
     @DeleteMapping("/calls")
@@ -61,20 +121,35 @@ public class AdminDataController {
     // ─── Notifications (from Google Sheets, fallback to PostgreSQL) ───
 
     @GetMapping("/notifications")
-    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getNotifications(@PathVariable Long deviceId) {
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getNotifications(
+            @PathVariable Long deviceId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
 
         // 1. Try Google Sheets first
         List<Map<String, Object>> fromSheets = googleSheetsService.getNotifications(deviceId);
         if (!fromSheets.isEmpty()) {
-            return ResponseEntity.ok(ApiResponse.ok(fromSheets));
+            int total = fromSheets.size();
+            int from = page * size;
+            int to = Math.min(from + size, total);
+            List<Map<String, Object>> paged = from >= total ? List.of() : fromSheets.subList(from, to);
+            
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("items", paged);
+            result.put("total", total);
+            result.put("page", page);
+            result.put("pages", (int) Math.ceil((double) total / size));
+            return ResponseEntity.ok(ApiResponse.ok(result));
         }
 
         // 2. Fall back to PostgreSQL (legacy data)
         List<DeviceNotification> dbNotifs = notificationRepository.findByDeviceIdOrderByReceivedAtDesc(deviceId);
-        List<Map<String, Object>> result = new java.util.ArrayList<>();
-        for (DeviceNotification n : dbNotifs) {
-            java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+        int total = dbNotifs.size();
+        int from = page * size;
+        int to = Math.min(from + size, total);
+        List<Map<String, Object>> items = dbNotifs.subList(Math.min(from, total), to).stream().map(n -> {
+            Map<String, Object> m = new LinkedHashMap<>();
             m.put("id", n.getId());
             m.put("deviceId", n.getDeviceId());
             m.put("packageName", n.getPackageName());
@@ -82,8 +157,14 @@ public class AdminDataController {
             m.put("title", n.getTitle());
             m.put("text", n.getText());
             m.put("receivedAt", n.getReceivedAt());
-            result.add(m);
-        }
+            return m;
+        }).collect(Collectors.toList());
+        
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("items", items);
+        result.put("total", (long) total);
+        result.put("page", page);
+        result.put("pages", (int) Math.ceil((double) total / size));
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
