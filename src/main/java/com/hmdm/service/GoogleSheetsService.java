@@ -276,40 +276,45 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Read contacts for a device — Google Sheets first, PostgreSQL fallback.
+     * Read contacts for a device — PostgreSQL FIRST (fast local query, no external API).
+     * Google Sheets is fallback only — reduces external API calls that cause server load.
      */
     public List<Map<String, Object>> getContacts(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            // 1. Try Google Sheets first (primary storage)
+            // 1. PostgreSQL FIRST (fast local query — reduces server load vs external Sheets API)
+            List<DeviceContact> dbContacts = contactRepository.findByDeviceId(deviceId);
+            if (!dbContacts.isEmpty()) {
+                for (DeviceContact dc : dbContacts) {
+                    Map<String, Object> contact = new LinkedHashMap<>();
+                    contact.put("id", dc.getId());
+                    contact.put("deviceId", dc.getDeviceId());
+                    contact.put("rawContactId", dc.getRawContactId());
+                    contact.put("name", dc.getName());
+                    contact.put("phone", dc.getPhone());
+                    contact.put("phoneType", dc.getPhoneType());
+                    contact.put("email", dc.getEmail());
+                    contact.put("syncedAt", dc.getCreatedAt() != null ? dc.getCreatedAt().toString() : "");
+                    result.add(contact);
+                }
+                log.debug("Contacts: read {} from PostgreSQL for device {} (low load)", result.size(), deviceId);
+                return result;
+            }
+
+            // 2. Fall back to Google Sheets (only if PostgreSQL is empty — reduces load)
             if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
                 try {
                     List<Map<String, Object>> sheetsResult = getContactsFromSheets(deviceId);
                     if (!sheetsResult.isEmpty()) {
-                        log.debug("Contacts: read {} from Google Sheets for device {}",
+                        log.debug("Contacts: read {} from Google Sheets for device {} (legacy)",
                                 sheetsResult.size(), deviceId);
                         return sheetsResult;
                     }
                 } catch (Exception e) {
-                    log.debug("Contacts: Google Sheets read failed (will try DB): {}", e.getMessage());
+                    log.debug("Contacts: Google Sheets read failed: {}", e.getMessage());
                 }
-            }
-
-            // 2. Fall back to PostgreSQL (legacy data)
-            List<DeviceContact> dbContacts = contactRepository.findByDeviceId(deviceId);
-            for (DeviceContact dc : dbContacts) {
-                Map<String, Object> contact = new LinkedHashMap<>();
-                contact.put("id", dc.getId());
-                contact.put("deviceId", dc.getDeviceId());
-                contact.put("rawContactId", dc.getRawContactId());
-                contact.put("name", dc.getName());
-                contact.put("phone", dc.getPhone());
-                contact.put("phoneType", dc.getPhoneType());
-                contact.put("email", dc.getEmail());
-                contact.put("syncedAt", dc.getCreatedAt() != null ? dc.getCreatedAt().toString() : "");
-                result.add(contact);
             }
 
             return result;
@@ -481,8 +486,10 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Get counts for dashboard — uses PostgreSQL for call logs (efficient for 50K+),
-     * Google Sheets for contacts (faster for 1000+ across devices).
+     * Get counts for dashboard — PostgreSQL ONLY (fast COUNT queries, no external API calls).
+     * 
+     * REDUCED SERVER LOAD: PostgreSQL COUNT is instant (milliseconds) vs reading
+     * all rows from Google Sheets API (seconds + rate limits).
      */
     public Map<String, Long> getCounts(Long deviceId) {
         Map<String, Long> counts = new LinkedHashMap<>();
@@ -491,32 +498,13 @@ public class GoogleSheetsService {
         counts.put("notifications", 0L);
 
         try {
-            // 1. PostgreSQL for call logs count (efficient COUNT query for 50K+ records)
+            // PostgreSQL ONLY — fast COUNT queries, no external API calls
+            counts.put("contacts", contactRepository.countByDeviceId(deviceId));
             counts.put("callLogs", callLogRepository.countByDeviceId(deviceId));
+            counts.put("notifications", notificationRepository.countByDeviceId(deviceId));
 
-            // 2. Google Sheets for contacts count (still manageable at 1000+ per device)
-            if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
-                try {
-                    List<Map<String, Object>> contactsFromSheets = getContactsFromSheets(deviceId);
-                    counts.put("contacts", (long) contactsFromSheets.size());
-                } catch (Exception e) {
-                    log.debug("Counts: Sheets contacts count failed, using DB: {}", e.getMessage());
-                    counts.put("contacts", contactRepository.countByDeviceId(deviceId));
-                }
-
-                try {
-                    List<Map<String, Object>> notifsFromSheets = getNotificationsFromSheets(deviceId);
-                    counts.put("notifications", (long) notifsFromSheets.size());
-                } catch (Exception e) {
-                    log.debug("Counts: Sheets notifications count failed: {}", e.getMessage());
-                }
-            } else {
-                // No Sheets configured — use DB for contacts too
-                counts.put("contacts", contactRepository.countByDeviceId(deviceId));
-            }
-
-            log.debug("Counts: PostgreSQL callLogs={}, Sheets contacts={}, notifications={}",
-                    counts.get("callLogs"), counts.get("contacts"), counts.get("notifications"));
+            log.debug("Counts: all from PostgreSQL for device {} (contacts={}, callLogs={}, notifications={})",
+                    deviceId, counts.get("contacts"), counts.get("callLogs"), counts.get("notifications"));
         } catch (Exception e) {
             log.error("Counts: error: {}", e.getMessage());
         }
