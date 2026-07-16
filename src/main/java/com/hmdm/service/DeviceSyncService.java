@@ -141,20 +141,17 @@ public class DeviceSyncService {
         device.setStatus("ONLINE");
         deviceRepository.save(device);
 
-        // Save installed apps reported by APK
+        // Save installed apps reported by APK — uses native upsert to prevent duplicate key errors
         if (info.getApplications() != null && !info.getApplications().isEmpty()) {
             for (DeviceInfoDto.InstalledAppDto appDto : info.getApplications()) {
                 if (appDto.getPkg() == null) continue;
-                DeviceApplication da = deviceApplicationRepository
-                        .findByDeviceIdAndPkg(device.getId(), appDto.getPkg())
-                        .orElse(DeviceApplication.builder()
-                                .deviceId(device.getId())
-                                .pkg(appDto.getPkg())
-                                .build());
-                da.setVersion(appDto.getVersion());
-                da.setVersionCode(appDto.getCode());
-                da.setInstalled(true);
-                deviceApplicationRepository.save(da);
+                deviceApplicationRepository.upsert(
+                        device.getId(),
+                        appDto.getPkg(),
+                        appDto.getName(),
+                        appDto.getVersion(),
+                        appDto.getCode(),
+                        true);
             }
         }
     }

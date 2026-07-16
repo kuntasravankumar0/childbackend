@@ -539,12 +539,15 @@ public class GoogleSheetsService {
 
     /**
      * Count rows in a Google Sheet for a specific device ID.
+     * Reads only column A (device ID) to minimize memory usage — 1/7th of reading A:G.
      * Uses the cached missing-sheet check to avoid unnecessary API calls.
+     * Results may be slightly stale (within MISSING_SHEETS_CACHE_TTL_MS).
      */
     private long getCountFromSheets(Long deviceId, String sheetName, int deviceIdCol) {
         if (isSheetMissing(sheetName)) return 0L;
         try {
-            String range = sheetName + "!A:G";
+            // Read only column A (device ID) to minimize memory — 7x less than A:G
+            String range = sheetName + "!A:A";
             List<List<Object>> rows;
             try {
                 rows = readRange(range);
@@ -558,7 +561,7 @@ public class GoogleSheetsService {
             long count = 0;
             for (int i = 1; i < rows.size(); i++) {
                 List<Object> row = rows.get(i);
-                if (!row.isEmpty() && deviceIdStr.equals(getStr(row, deviceIdCol))) {
+                if (!row.isEmpty() && deviceIdStr.equals(getStr(row, 0))) {
                     count++;
                 }
             }
