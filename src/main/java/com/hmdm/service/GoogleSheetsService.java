@@ -14,6 +14,7 @@ import com.hmdm.entity.CallLog;
 import com.hmdm.entity.DeviceContact;
 import com.hmdm.repository.CallLogRepository;
 import com.hmdm.repository.DeviceContactRepository;
+import com.hmdm.repository.DeviceNotificationRepository;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -111,6 +112,9 @@ public class GoogleSheetsService {
 
     @Autowired
     private CallLogRepository callLogRepository;
+
+    @Autowired
+    private DeviceNotificationRepository notificationRepository;
 
     private Sheets sheetsService;
     private boolean initialized = false;
