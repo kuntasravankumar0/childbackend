@@ -34,15 +34,15 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 
 /**
- * Service for syncing device contacts and call logs to Google Sheets.
+ * Service for syncing device contacts and call logs to Google Sheets + PostgreSQL.
  *
  * DATA FLOW (Production with API key):
  *   Android APK → Apps Script Web App → Google Sheets (WRITE)
  *   Backend Admin API → Google Sheets API Key → Google Sheets (READ)
- *   PostgreSQL = read-only fallback for legacy data only.
+ *   PostgreSQL = primary read source for contacts & call logs (Sheets = backup)
  *
  * DATA FLOW (Service account available):
- *   Backend writes directly to Sheets + PostgreSQL backup.
+ *   Backend writes directly to Sheets + PostgreSQL primary.
  *
  * Required environment variables:
  *   GOOGLE_SHEETS_SPREADSHEET_ID — The spreadsheet ID from the sheet URL
@@ -140,7 +140,7 @@ public class GoogleSheetsService {
                 sheetsService = createSheetsService(credentials);
                 initialized = true;
                 log.info("GoogleSheetsService: initialized with service account (read/write to Sheets)");
-                log.info("GoogleSheetsService: contacts & call logs synced to Sheets + PostgreSQL backup");
+                log.info("GoogleSheetsService: contacts & call logs synced to Sheets + PostgreSQL");
                 // Pre-check which Sheets tabs exist to avoid repeated 400 errors
                 preCheckSheets();
                 return;
@@ -159,7 +159,7 @@ public class GoogleSheetsService {
                 initialized = true;
                 log.info("GoogleSheetsService: initialized with API key — Google Sheets is READ-ONLY. " +
                         "Contacts & call logs written by APK → Apps Script → Sheets. " +
-                        "Backend reads from Sheets via API key. PostgreSQL is fallback.");
+                        "Backend reads from PostgreSQL (primary) + Sheets fallback.");
                 // Pre-check which Sheets tabs exist to avoid repeated 400 errors
                 preCheckSheets();
                 return;
@@ -219,7 +219,6 @@ public class GoogleSheetsService {
         if (credentials != null) {
             requestInitializer = new HttpCredentialsAdapter(credentials);
         } else {
-            // No auth — will use API key in the URL
             requestInitializer = request -> {};
         }
 
@@ -229,52 +228,72 @@ public class GoogleSheetsService {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  CONTACTS  (Google Sheets primary, PostgreSQL read-only fallback)
+    //  CONTACTS  (PostgreSQL primary read source + Sheets backup)
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Sync contacts — Google Sheets ONLY (reduces DB server load).
+     * Sync contacts — ALWAYS save to PostgreSQL FIRST (fast reads on web dashboard).
      *
-     * Contacts are stored EXCLUSIVELY in Google Sheets to reduce DB write load.
-     * PostgreSQL is only used as READ fallback when Sheets is unavailable.
+     * PostgreSQL is the PRIMARY read source for instant data access on the web dashboard.
+     * Google Sheets remains as backup/sync target.
+     * This matches how syncCallLogs() works — PostgreSQL-first for speed.
+     *
+     * IMPORTANT: Without PostgreSQL-first, getContacts() takes 5+ minutes for 1000+ contacts
+     * because it has to fetch from the slow Google Sheets API every time.
      */
     public int syncContacts(Long deviceId, List<Map<String, Object>> contacts) {
         if (!initialized) return 0;
 
+        int outerBatchSize = 2000;
+        int totalProcessed = 0;
+
         try {
-            // 1. Try writing to Google Sheets directly (service account mode)
-            boolean sheetsWritten = false;
-            if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
-                syncContactsToSheets(deviceId, contacts);
-                sheetsWritten = true;
-                log.info("Contacts: synced {} to Google Sheets for device {}", contacts.size(), deviceId);
-            }
+            // Process in outer batches of 2000 to keep peak memory low
+            for (int batchStart = 0; batchStart < contacts.size(); batchStart += outerBatchSize) {
+                int batchEnd = Math.min(batchStart + outerBatchSize, contacts.size());
+                List<Map<String, Object>> batch = contacts.subList(batchStart, batchEnd);
 
-            // 2. Fallback: write via Apps Script Web App (API key mode)
-            if (!sheetsWritten && webappUrl != null && !webappUrl.isBlank()) {
-                try {
-                    Map<String, Object> sheetsPayload = new LinkedHashMap<>();
-                    sheetsPayload.put("action", "syncAll");
-                    sheetsPayload.put("deviceId", String.valueOf(deviceId));
-                    sheetsPayload.put("contacts", contacts);
-                    sendToWebApp(sheetsPayload);
-                    sheetsWritten = true;
-                    log.info("Contacts: sent {} to Google Sheets via web app fallback", contacts.size());
-                } catch (Exception we) {
-                    log.warn("Contacts: web app fallback failed: {}", we.getMessage());
-                }
-            }
-
-            // 3. ONLY save to PostgreSQL if ALL Sheets paths failed (reduces DB load)
-            if (!sheetsWritten) {
-                int dbSaved = saveContactsToDb(deviceId, contacts);
+                // 1. ALWAYS save to PostgreSQL FIRST (primary read source — instant reads on web)
+                // Without this, getContacts() hits slow Google Sheets API every time (5+ min wait)
+                int dbSaved = saveContactsToDb(deviceId, batch);
                 if (dbSaved > 0) {
-                    log.info("Contacts: saved {} to PostgreSQL (Sheets unavailable)", dbSaved);
+                    totalProcessed += dbSaved;
+                    log.info("Contacts: saved {}/{} to PostgreSQL for device {} (primary storage, batch {}-{})",
+                            dbSaved, batch.size(), deviceId, batchStart, batchEnd);
                 }
-            } else {
-                log.debug("Contacts: NOT saving to PostgreSQL — Sheets only (reduced DB load)");
+
+                // 2. Try writing to Google Sheets (backup)
+                boolean sheetsWritten = false;
+                if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
+                    try {
+                        syncContactsToSheets(deviceId, batch);
+                        sheetsWritten = true;
+                        log.debug("Contacts: synced batch {}-{} to Sheets (backup)", batchStart, batchEnd);
+                    } catch (Exception e) {
+                        log.warn("Contacts: Sheets batch {}-{} failed: {}", batchStart, batchEnd, e.getMessage());
+                    }
+                }
+
+                // 3. Fallback: write via Apps Script Web App (API key mode)
+                if (!sheetsWritten && webappUrl != null && !webappUrl.isBlank()) {
+                    try {
+                        Map<String, Object> sheetsPayload = new LinkedHashMap<>();
+                        sheetsPayload.put("action", "syncAll");
+                        sheetsPayload.put("deviceId", String.valueOf(deviceId));
+                        sheetsPayload.put("contacts", batch);
+                        sendToWebApp(sheetsPayload);
+                        sheetsWritten = true;
+                        log.debug("Contacts: webapp batch {}-{} OK (backup)", batchStart, batchEnd);
+                    } catch (Exception we) {
+                        log.warn("Contacts: webapp batch {}-{} failed: {}", batchStart, batchEnd, we.getMessage());
+                    }
+                }
+
+                // Explicitly clear batch reference so GC can collect it
+                batch = null;
             }
 
+            log.info("Contacts: synced {} total to PostgreSQL for device {} (primary storage)", totalProcessed, deviceId);
             return contacts.size();
 
         } catch (Exception e) {
@@ -307,16 +326,16 @@ public class GoogleSheetsService {
                     contact.put("syncedAt", dc.getCreatedAt() != null ? dc.getCreatedAt().toString() : "");
                     result.add(contact);
                 }
-                log.debug("Contacts: read {} from PostgreSQL for device {} (low load)", result.size(), deviceId);
+                log.debug("Contacts: read {} from PostgreSQL for device {} (instant, low load)", result.size(), deviceId);
                 return result;
             }
 
-            // 2. Fall back to Google Sheets (only if PostgreSQL is empty — reduces load)
+            // 2. Fall back to Google Sheets (only if PostgreSQL is empty — legacy data)
             if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
                 try {
                     List<Map<String, Object>> sheetsResult = getContactsFromSheets(deviceId);
                     if (!sheetsResult.isEmpty()) {
-                        log.debug("Contacts: read {} from Google Sheets for device {} (legacy)",
+                        log.debug("Contacts: read {} from Google Sheets for device {} (legacy fallback)",
                                 sheetsResult.size(), deviceId);
                         return sheetsResult;
                     }
@@ -356,11 +375,11 @@ public class GoogleSheetsService {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  CALL LOGS  (Google Sheets primary, PostgreSQL read-only fallback)
+    //  CALL LOGS  (PostgreSQL primary read source + Sheets backup)
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Sync call logs — ALWAYS save to PostgreSQL (primary read source for 50K+ logs) + Sheets (backup).
+     * Sync call logs — ALWAYS save to PostgreSQL FIRST (primary read source for 50K+ logs) + Sheets (backup).
      *
      * With 50,000+ call logs per device, Google Sheets cannot handle efficient reads.
      * PostgreSQL is the PRIMARY read source with pagination support.
@@ -387,7 +406,7 @@ public class GoogleSheetsService {
                             saved, batch.size(), deviceId, batchStart, batchEnd);
                 }
 
-                // 2. Try writing to Google Sheets (backup) — already batched at 500 inside
+                // 2. Try writing to Google Sheets (backup)
                 if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
                     int sheetsBatchSize = 500;
                     for (int i = 0; i < batch.size(); i += sheetsBatchSize) {
@@ -444,7 +463,6 @@ public class GoogleSheetsService {
 
         try {
             // 1. PostgreSQL is PRIMARY read source (supports pagination, search, filtering)
-            // Only fetches all for legacy compatibility — controllers should use paginated methods
             List<CallLog> dbCalls = callLogRepository.findByDeviceIdOrderByCallDateDesc(deviceId);
             if (!dbCalls.isEmpty()) {
                 for (CallLog cl : dbCalls) {
@@ -463,7 +481,7 @@ public class GoogleSheetsService {
                 return result;
             }
 
-            // 2. Fall back to Google Sheets (legacy data only — will be deprecated)
+            // 2. Fall back to Google Sheets (legacy data only)
             if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
                 try {
                     List<Map<String, Object>> sheetsResult = getCallLogsFromSheets(deviceId);
@@ -490,7 +508,6 @@ public class GoogleSheetsService {
     public void deleteCallLogs(Long deviceId) {
         if (!initialized) return;
         try {
-            // Try to delete from Sheets if service account available
             if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
                 try {
                     deleteCallLogsFromSheets(deviceId);
@@ -499,7 +516,6 @@ public class GoogleSheetsService {
                     log.warn("CallLogs: Sheets delete failed: {}", e.getMessage());
                 }
             }
-            // Also clean up PostgreSQL
             callLogRepository.deleteByDeviceId(deviceId);
             log.info("CallLogs: deleted all for device {} from PostgreSQL", deviceId);
         } catch (Exception e) {
@@ -509,14 +525,6 @@ public class GoogleSheetsService {
 
     /**
      * Get counts for dashboard — PostgreSQL FIRST (fast COUNT queries), Sheets fallback.
-     * 
-     * REDUCED SERVER LOAD:
-     * - Call logs: PostgreSQL COUNT only (always saved to DB, instant).
-     * - Contacts: PostgreSQL first, Sheets fallback (contacts are Sheets-only in production).
-     * - Notifications: PostgreSQL first, Sheets fallback.
-     * 
-     * The Sheets fallback for contacts/notifications is necessary because those
-     * are stored EXCLUSIVELY in Google Sheets to reduce DB write load.
      */
     public Map<String, Long> getCounts(Long deviceId) {
         Map<String, Long> counts = new LinkedHashMap<>();
@@ -528,13 +536,11 @@ public class GoogleSheetsService {
             // Call logs: PostgreSQL ONLY (always saved to DB — instant COUNT query)
             counts.put("callLogs", callLogRepository.countByDeviceId(deviceId));
 
-            // Contacts: PostgreSQL first, fall back to Sheets
-            // (contacts are Sheets-only in normal production flow to reduce DB writes)
+            // Contacts: PostgreSQL FIRST (now always saved to DB for fast reads)
             Long contactCount = contactRepository.countByDeviceId(deviceId);
             if (contactCount > 0) {
                 counts.put("contacts", contactCount);
             } else if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
-                // Fall back to counting from Sheets (cached missing-sheet check avoids 400 errors)
                 counts.put("contacts", getCountFromSheets(deviceId, SHEET_CONTACTS, COL_DEVICE_ID));
             }
 
@@ -559,12 +565,10 @@ public class GoogleSheetsService {
      * Count rows in a Google Sheet for a specific device ID.
      * Reads only column A (device ID) to minimize memory usage — 1/7th of reading A:G.
      * Uses the cached missing-sheet check to avoid unnecessary API calls.
-     * Results may be slightly stale (within MISSING_SHEETS_CACHE_TTL_MS).
      */
     private long getCountFromSheets(Long deviceId, String sheetName, int deviceIdCol) {
         if (isSheetMissing(sheetName)) return 0L;
         try {
-            // Read only column A (device ID) to minimize memory — 7x less than A:G
             String range = sheetName + "!A:A";
             List<List<Object>> rows;
             try {
@@ -591,19 +595,14 @@ public class GoogleSheetsService {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  NOTIFICATIONS (Google Sheets primary, PostgreSQL fallback)
+    //  NOTIFICATIONS (PostgreSQL primary + Sheets fallback)
     // ═══════════════════════════════════════════════════════════════════
 
-    /**
-     * Read notifications for a device — Google Sheets first, empty fallback.
-     * (Controller handles PostgreSQL fallback separately.)
-     */
     public List<Map<String, Object>> getNotifications(Long deviceId) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (!initialized) return result;
 
         try {
-            // Try Google Sheets first
             if (sheetsService != null && spreadsheetId != null && !spreadsheetId.isBlank()) {
                 try {
                     List<Map<String, Object>> sheetsResult = getNotificationsFromSheets(deviceId);
@@ -629,7 +628,7 @@ public class GoogleSheetsService {
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Save contacts to PostgreSQL as a backup layer.
+     * Save contacts to PostgreSQL.
      * Dedup by deviceId + rawContactId.
      * Flushes & clears Hibernate session every 500 records to prevent OOM.
      */
@@ -663,7 +662,6 @@ public class GoogleSheetsService {
             }
             dbSaved++;
 
-            // Periodically flush & clear Hibernate session to prevent OOM
             sinceFlush++;
             if (sinceFlush >= 500) {
                 entityManager.flush();
@@ -671,7 +669,6 @@ public class GoogleSheetsService {
                 sinceFlush = 0;
             }
         }
-        // Final flush for remaining records
         if (sinceFlush > 0) {
             entityManager.flush();
             entityManager.clear();
@@ -680,7 +677,7 @@ public class GoogleSheetsService {
     }
 
     /**
-     * Save call logs to PostgreSQL as a backup layer.
+     * Save call logs to PostgreSQL.
      * Dedup by deviceId + phoneNumber + callDate + callType + contactName.
      * Flushes & clears Hibernate session every 500 records to prevent OOM.
      */
@@ -708,8 +705,6 @@ public class GoogleSheetsService {
                     .build());
             saved++;
 
-            // Periodically flush & clear Hibernate session to prevent OOM
-            // Without this, 50K+ entities accumulate in the persistence context
             sinceFlush++;
             if (sinceFlush >= 500) {
                 entityManager.flush();
@@ -717,7 +712,6 @@ public class GoogleSheetsService {
                 sinceFlush = 0;
             }
         }
-        // Final flush for remaining records
         if (sinceFlush > 0) {
             entityManager.flush();
             entityManager.clear();
@@ -817,10 +811,8 @@ public class GoogleSheetsService {
             }
         }
 
-        // Delete in reverse order to keep indices valid
         Collections.sort(rowsToDelete, Collections.reverseOrder());
         for (int rowIndex : rowsToDelete) {
-            // Clear the row contents instead of deleting (Google Sheets API limitation)
             String range = SHEET_CONTACTS + "!A" + (rowIndex + 1) + ":G" + (rowIndex + 1);
             updateRange(range, Collections.singletonList(Arrays.asList("", "", "", "", "", "", "")));
         }
@@ -928,7 +920,6 @@ public class GoogleSheetsService {
     private List<Map<String, Object>> getNotificationsFromSheets(Long deviceId) throws IOException {
         List<Map<String, Object>> result = new ArrayList<>();
 
-        // Skip if we already know the Notifications sheet doesn't exist (cache check)
         if (isSheetMissing(SHEET_NOTIFICATIONS)) {
             return result;
         }
@@ -981,7 +972,6 @@ public class GoogleSheetsService {
             boolean exists = spreadsheet.getSheets().stream()
                     .anyMatch(s -> sheetName.equals(s.getProperties().getTitle()));
             if (!exists) {
-                // Add sheet with headers
                 var addRequest = new BatchUpdateSpreadsheetRequest()
                         .setRequests(Collections.singletonList(
                                 new Request().setAddSheet(new AddSheetRequest()
@@ -993,7 +983,6 @@ public class GoogleSheetsService {
                     sheetsService.spreadsheets().batchUpdate(spreadsheetId, addRequest).execute();
                 }
 
-                // Add header row
                 if (!headers.isEmpty()) {
                     String range = sheetName + "!A1:" + (char) ('A' + headers.size() - 1) + "1";
                     updateRange(range, Collections.singletonList(new ArrayList<>(headers)));
@@ -1074,42 +1063,26 @@ public class GoogleSheetsService {
                 .format(Instant.now());
     }
 
-    /**
-     * Check if a sheet is known to be missing (cached to avoid repeated API calls).
-     * Cache expires after MISSING_SHEETS_CACHE_TTL_MS so sheets created later are detected.
-     */
     private boolean isSheetMissing(String sheetName) {
         if (missingSheets.isEmpty()) return false;
         long now = System.currentTimeMillis();
         if (now - missingSheetsCheckedAt > MISSING_SHEETS_CACHE_TTL_MS) {
-            // Cache expired — clear so we retry
             missingSheets.clear();
             return false;
         }
         return missingSheets.contains(sheetName);
     }
 
-    /**
-     * Mark a sheet as missing so we skip it for the cache duration.
-     */
     private void markSheetMissing(String sheetName) {
         missingSheets.add(sheetName);
         missingSheetsCheckedAt = System.currentTimeMillis();
     }
 
-    /**
-     * Check if an exception is a "range parse error" (sheet doesn't exist).
-     */
     private boolean isRangeParseError(Exception e) {
         String msg = e.getMessage();
         return msg != null && (msg.contains("400") || msg.contains("Unable to parse range") || msg.contains("INVALID_ARGUMENT"));
     }
 
-    /**
-     * Fallback: POST data to the Google Sheets Apps Script Web App.
-     * This is the same endpoint the Android APK uses.
-     * The Web App has authorization to write to the sheet.
-     */
     private void sendToWebApp(Map<String, Object> payload) throws IOException {
         if (webappUrl == null || webappUrl.isBlank()) return;
 
