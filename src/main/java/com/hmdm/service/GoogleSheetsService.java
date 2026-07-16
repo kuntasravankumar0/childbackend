@@ -16,6 +16,7 @@ import com.hmdm.repository.CallLogRepository;
 import com.hmdm.repository.DeviceContactRepository;
 import com.hmdm.repository.DeviceNotificationRepository;
 import jakarta.annotation.PostConstruct;
+import jakarta.persistence.EntityManager;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -115,6 +116,9 @@ public class GoogleSheetsService {
 
     @Autowired
     private DeviceNotificationRepository notificationRepository;
+
+    @Autowired
+    private EntityManager entityManager;
 
     private Sheets sheetsService;
     private boolean initialized = false;
@@ -365,49 +369,63 @@ public class GoogleSheetsService {
     public int syncCallLogs(Long deviceId, List<Map<String, Object>> callLogs) {
         if (!initialized) return 0;
 
+        int outerBatchSize = 2000;
+        int totalProcessed = 0;
+
         try {
-            // 1. ALWAYS save to PostgreSQL (primary read source for paginated queries)
-            // PostgreSQL can efficiently query 50K+ records with LIMIT/OFFSET + search
-            int saved = saveCallLogsToDb(deviceId, callLogs);
-            if (saved > 0) {
-                log.info("CallLogs: saved {} to PostgreSQL for device {} (primary storage)", saved, deviceId);
-            }
+            // Process in outer batches of 2000 to keep peak memory low
+            // Each batch: saves to PostgreSQL (with EntityManager flush/clear), then Sheets
+            for (int batchStart = 0; batchStart < callLogs.size(); batchStart += outerBatchSize) {
+                int batchEnd = Math.min(batchStart + outerBatchSize, callLogs.size());
+                List<Map<String, Object>> batch = callLogs.subList(batchStart, batchEnd);
 
-            // 2. Try writing to Google Sheets (backup)
-            if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
-                // Batch write in chunks of 500 to avoid Sheets API limits
-                int batchSize = 500;
-                for (int i = 0; i < callLogs.size(); i += batchSize) {
-                    int end = Math.min(i + batchSize, callLogs.size());
-                    List<Map<String, Object>> batch = callLogs.subList(i, end);
-                    try {
-                        syncCallLogsToSheets(deviceId, batch);
-                        log.debug("CallLogs: synced batch {}-{} to Sheets", i, end);
-                    } catch (Exception e) {
-                        log.warn("CallLogs: Sheets batch {}-{} failed: {}", i, end, e.getMessage());
+                // 1. Save to PostgreSQL (with inner flush/clear every 500 records)
+                int saved = saveCallLogsToDb(deviceId, batch);
+                if (saved > 0) {
+                    totalProcessed += saved;
+                    log.info("CallLogs: saved {}/{} to PostgreSQL for device {} (primary storage, batch {}-{})",
+                            saved, batch.size(), deviceId, batchStart, batchEnd);
+                }
+
+                // 2. Try writing to Google Sheets (backup) — already batched at 500 inside
+                if (!useApiKey && sheetsService != null && credentialsJson != null && !credentialsJson.isBlank()) {
+                    int sheetsBatchSize = 500;
+                    for (int i = 0; i < batch.size(); i += sheetsBatchSize) {
+                        int end = Math.min(i + sheetsBatchSize, batch.size());
+                        List<Map<String, Object>> sheetsBatch = batch.subList(i, end);
+                        try {
+                            syncCallLogsToSheets(deviceId, sheetsBatch);
+                            log.debug("CallLogs: synced batch {}-{} to Sheets", batchStart + i, batchStart + end);
+                        } catch (Exception e) {
+                            log.warn("CallLogs: Sheets batch {}-{} failed: {}", batchStart + i, batchStart + end, e.getMessage());
+                        }
                     }
                 }
-            }
 
-            // 3. Fallback: write via Apps Script Web App (batched)
-            if (webappUrl != null && !webappUrl.isBlank()) {
-                int batchSize = 500;
-                for (int i = 0; i < callLogs.size(); i += batchSize) {
-                    int end = Math.min(i + batchSize, callLogs.size());
-                    List<Map<String, Object>> batch = callLogs.subList(i, end);
-                    try {
-                        Map<String, Object> sheetsPayload = new LinkedHashMap<>();
-                        sheetsPayload.put("action", "syncAll");
-                        sheetsPayload.put("deviceId", String.valueOf(deviceId));
-                        sheetsPayload.put("callLogs", batch);
-                        sendToWebApp(sheetsPayload);
-                        log.debug("CallLogs: webapp batch {}-{} OK", i, end);
-                    } catch (Exception we) {
-                        log.warn("CallLogs: webapp batch {}-{} failed: {}", i, end, we.getMessage());
+                // 3. Fallback: write via Apps Script Web App (batched)
+                if (webappUrl != null && !webappUrl.isBlank()) {
+                    int webBatchSize = 500;
+                    for (int i = 0; i < batch.size(); i += webBatchSize) {
+                        int end = Math.min(i + webBatchSize, batch.size());
+                        List<Map<String, Object>> webBatch = batch.subList(i, end);
+                        try {
+                            Map<String, Object> sheetsPayload = new LinkedHashMap<>();
+                            sheetsPayload.put("action", "syncAll");
+                            sheetsPayload.put("deviceId", String.valueOf(deviceId));
+                            sheetsPayload.put("callLogs", webBatch);
+                            sendToWebApp(sheetsPayload);
+                            log.debug("CallLogs: webapp batch {}-{} OK", batchStart + i, batchStart + end);
+                        } catch (Exception we) {
+                            log.warn("CallLogs: webapp batch {}-{} failed: {}", batchStart + i, batchStart + end, we.getMessage());
+                        }
                     }
                 }
+
+                // Explicitly clear the outer batch subList reference so GC can collect it
+                batch = null;
             }
 
+            log.info("CallLogs: synced {} total to PostgreSQL for device {} (primary storage)", totalProcessed, deviceId);
             return callLogs.size();
 
         } catch (Exception e) {
@@ -613,9 +631,11 @@ public class GoogleSheetsService {
     /**
      * Save contacts to PostgreSQL as a backup layer.
      * Dedup by deviceId + rawContactId.
+     * Flushes & clears Hibernate session every 500 records to prevent OOM.
      */
     private int saveContactsToDb(Long deviceId, List<Map<String, Object>> contacts) {
         int dbSaved = 0;
+        int sinceFlush = 0;
         for (Map<String, Object> contact : contacts) {
             String rawContactId = getStr(contact, "rawContactId");
             String name = getStr(contact, "name");
@@ -642,6 +662,19 @@ public class GoogleSheetsService {
                         .build());
             }
             dbSaved++;
+
+            // Periodically flush & clear Hibernate session to prevent OOM
+            sinceFlush++;
+            if (sinceFlush >= 500) {
+                entityManager.flush();
+                entityManager.clear();
+                sinceFlush = 0;
+            }
+        }
+        // Final flush for remaining records
+        if (sinceFlush > 0) {
+            entityManager.flush();
+            entityManager.clear();
         }
         return dbSaved;
     }
@@ -649,9 +682,11 @@ public class GoogleSheetsService {
     /**
      * Save call logs to PostgreSQL as a backup layer.
      * Dedup by deviceId + phoneNumber + callDate + callType + contactName.
+     * Flushes & clears Hibernate session every 500 records to prevent OOM.
      */
     private int saveCallLogsToDb(Long deviceId, List<Map<String, Object>> callLogs) {
         int saved = 0;
+        int sinceFlush = 0;
         for (Map<String, Object> call : callLogs) {
             String phoneNumber = getStr(call, "phoneNumber");
             String callType = getStr(call, "callType");
@@ -672,6 +707,20 @@ public class GoogleSheetsService {
                     .contactName(contactName)
                     .build());
             saved++;
+
+            // Periodically flush & clear Hibernate session to prevent OOM
+            // Without this, 50K+ entities accumulate in the persistence context
+            sinceFlush++;
+            if (sinceFlush >= 500) {
+                entityManager.flush();
+                entityManager.clear();
+                sinceFlush = 0;
+            }
+        }
+        // Final flush for remaining records
+        if (sinceFlush > 0) {
+            entityManager.flush();
+            entityManager.clear();
         }
         return saved;
     }
