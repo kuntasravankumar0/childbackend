@@ -133,6 +133,8 @@ public class GoogleSheetsService {
                 initialized = true;
                 log.info("GoogleSheetsService: initialized with service account (read/write to Sheets)");
                 log.info("GoogleSheetsService: contacts & call logs synced to Sheets + PostgreSQL backup");
+                // Pre-check which Sheets tabs exist to avoid repeated 400 errors
+                preCheckSheets();
                 return;
             } catch (Exception e) {
                 log.warn("GoogleSheetsService: GOOGLE_SHEETS_CREDENTIALS present but invalid (not a valid JSON service account key). " +
@@ -150,6 +152,8 @@ public class GoogleSheetsService {
                 log.info("GoogleSheetsService: initialized with API key — Google Sheets is READ-ONLY. " +
                         "Contacts & call logs written by APK → Apps Script → Sheets. " +
                         "Backend reads from Sheets via API key. PostgreSQL is fallback.");
+                // Pre-check which Sheets tabs exist to avoid repeated 400 errors
+                preCheckSheets();
                 return;
             } catch (Exception e) {
                 log.warn("GoogleSheetsService: API key initialization failed: {}. Fallback to DB-only.", e.getMessage());
