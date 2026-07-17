@@ -11,7 +11,7 @@ public class DeviceDataSyncDto {
 
     private List<ContactDto> contacts;
     private List<CallLogDto> callLogs;
-    private List<NotificationDto> notifications;
+    private List<MediaRecordDto> media;
 
     @Data
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -35,11 +35,10 @@ public class DeviceDataSyncDto {
 
     @Data
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class NotificationDto {
-        private String packageName;
-        private String appName;
-        private String title;
-        private String text;
-        private Long receivedAt;
+    public static class MediaRecordDto {
+        private String mediaType;   // "camera" or "audio"
+        private String fileName;
+        private Long fileSize;
+        private Long capturedAt;
     }
 }

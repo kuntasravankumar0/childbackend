@@ -2,9 +2,7 @@ package com.hmdm.controller;
 
 import com.hmdm.dto.ApiResponse;
 import com.hmdm.entity.CallLog;
-import com.hmdm.entity.DeviceNotification;
 import com.hmdm.repository.CallLogRepository;
-import com.hmdm.repository.DeviceNotificationRepository;
 import com.hmdm.repository.DeviceRepository;
 import com.hmdm.service.GoogleSheetsService;
 import lombok.RequiredArgsConstructor;
@@ -29,7 +27,6 @@ import java.util.stream.Collectors;
 public class AdminDataController {
 
     private final DeviceRepository deviceRepository;
-    private final DeviceNotificationRepository notificationRepository;
     private final CallLogRepository callLogRepository;
     private final GoogleSheetsService googleSheetsService;
 
@@ -56,13 +53,6 @@ public class AdminDataController {
         result.put("pages", (int) Math.ceil((double) total / size));
         
         return ResponseEntity.ok(ApiResponse.ok(result));
-    }
-
-    @DeleteMapping("/contacts")
-    public ResponseEntity<ApiResponse<Void>> deleteContacts(@PathVariable Long deviceId) {
-        if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        googleSheetsService.deleteContacts(deviceId);
-        return ResponseEntity.ok(ApiResponse.ok());
     }
 
     // ─── Call Logs (from PostgreSQL with pagination + server-side search) ─
@@ -106,99 +96,6 @@ public class AdminDataController {
         result.put("type", type);
         
         return ResponseEntity.ok(ApiResponse.ok(result));
-    }
-
-    @DeleteMapping("/calls")
-    public ResponseEntity<ApiResponse<Void>> deleteCallLogs(@PathVariable Long deviceId) {
-        if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        googleSheetsService.deleteCallLogs(deviceId);
-        return ResponseEntity.ok(ApiResponse.ok());
-    }
-
-    // ─── Notifications (from PostgreSQL with pagination, Sheets fallback) ───
-
-    @GetMapping("/notifications")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> getNotifications(
-            @PathVariable Long deviceId,
-            @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "100") int size) {
-        if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-
-        // 1. Use paginated PostgreSQL query (fast, memory-efficient)
-        PageRequest pageRequest = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "receivedAt"));
-        Page<DeviceNotification> notifPage = notificationRepository.findByDeviceIdOrderByReceivedAtDesc(deviceId, pageRequest);
-        
-        if (notifPage.hasContent()) {
-            List<Map<String, Object>> items = notifPage.getContent().stream().map(n -> {
-                Map<String, Object> m = new LinkedHashMap<>();
-                m.put("id", n.getId());
-                m.put("deviceId", n.getDeviceId());
-                m.put("packageName", n.getPackageName());
-                m.put("appName", n.getAppName());
-                m.put("title", n.getTitle());
-                m.put("text", n.getText());
-                m.put("receivedAt", n.getReceivedAt());
-                return m;
-            }).collect(Collectors.toList());
-            
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("items", items);
-            result.put("total", notifPage.getTotalElements());
-            result.put("page", page);
-            result.put("pages", notifPage.getTotalPages());
-            return ResponseEntity.ok(ApiResponse.ok(result));
-        }
-
-        // 2. Fall back to Google Sheets (legacy data only)
-        List<Map<String, Object>> fromSheets = googleSheetsService.getNotifications(deviceId);
-        if (!fromSheets.isEmpty()) {
-            int total = fromSheets.size();
-            int from = page * size;
-            int to = Math.min(from + size, total);
-            List<Map<String, Object>> paged = from >= total ? List.of() : fromSheets.subList(from, to);
-            
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("items", paged);
-            result.put("total", (long) total);
-            result.put("page", page);
-            result.put("pages", (int) Math.ceil((double) total / size));
-            return ResponseEntity.ok(ApiResponse.ok(result));
-        }
-
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("items", List.of());
-        result.put("total", 0L);
-        result.put("page", page);
-        result.put("pages", 0);
-        return ResponseEntity.ok(ApiResponse.ok(result));
-    }
-
-    /**
-     * Delete a SINGLE notification by ID.
-     * Admin can delete individual notifications without removing all others.
-     * Returns 404 if the notification doesn't exist or doesn't belong to this device.
-     */
-    @DeleteMapping("/notifications/{notifId}")
-    public ResponseEntity<ApiResponse<Void>> deleteNotification(
-            @PathVariable Long deviceId,
-            @PathVariable Long notifId) {
-        if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-
-        // Check that the notification actually belongs to this device
-        var notif = notificationRepository.findByIdAndDeviceId(notifId, deviceId);
-        if (notif.isEmpty()) return ResponseEntity.notFound().build();
-
-        notificationRepository.deleteByIdAndDeviceId(notifId, deviceId);
-        log.info("Notification {} deleted for device {}", notifId, deviceId);
-        return ResponseEntity.ok(ApiResponse.ok());
-    }
-
-    @DeleteMapping("/notifications")
-    public ResponseEntity<ApiResponse<Void>> deleteNotifications(@PathVariable Long deviceId) {
-        if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        notificationRepository.deleteByDeviceId(deviceId);
-        log.info("All notifications deleted for device {}", deviceId);
-        return ResponseEntity.ok(ApiResponse.ok());
     }
 
     // ─── Dashboard counts ───

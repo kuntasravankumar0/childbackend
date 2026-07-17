@@ -16,6 +16,8 @@ public interface DeviceLocationRepository extends JpaRepository<DeviceLocation, 
     List<DeviceLocation> findByDeviceIdOrderByTsDesc(Long deviceId, Pageable pageable);
     Optional<DeviceLocation> findTopByDeviceIdOrderByTsDesc(Long deviceId);
 
+    long countByDeviceId(Long deviceId);
+
     @Modifying
     @Transactional
     void deleteByDeviceId(Long deviceId);

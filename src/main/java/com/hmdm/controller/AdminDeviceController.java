@@ -17,8 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 @RestController
 @RequestMapping("/api/devices")
@@ -34,7 +33,6 @@ public class AdminDeviceController {
     private final DeviceApplicationRepository   deviceApplicationRepository;
     private final DeviceContactRepository       contactRepository;
     private final CallLogRepository             callLogRepository;
-    private final DeviceNotificationRepository  notificationRepository;
     private final GeofenceRepository            geofenceRepository;
 
     /** List devices with pagination + search */
@@ -87,11 +85,8 @@ public class AdminDeviceController {
     @Transactional
     public ResponseEntity<ApiResponse<Void>> deleteDevice(@PathVariable Long id) {
         if (!deviceRepository.existsById(id)) return ResponseEntity.notFound().build();
-        // Clean up ALL related data before deleting the device
-        // (foreign key constraints require removing child records first)
         contactRepository.deleteByDeviceId(id);
         callLogRepository.deleteByDeviceId(id);
-        notificationRepository.deleteByDeviceId(id);
         pushMessageRepository.deleteByDeviceId(id);
         logRepository.deleteByDeviceId(id);
         locationRepository.deleteByDeviceId(id);
@@ -141,6 +136,60 @@ public class AdminDeviceController {
                 .sent(false)
                 .build());
         return ResponseEntity.ok(ApiResponse.ok());
+    }
+
+    // ─── Device Features: Show which features are working per device ────
+
+    /** Get feature status for a single device */
+    @GetMapping("/{id}/features")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getFeatures(@PathVariable Long id) {
+        return deviceRepository.findById(id)
+                .map(device -> ResponseEntity.ok(ApiResponse.ok(computeFeatures(device, id))))
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    /** Batch get features for multiple device IDs */
+    @PostMapping("/features/batch")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> batchFeatures(
+            @RequestBody Map<String, List<Long>> body) {
+        List<Long> ids = body.getOrDefault("ids", List.of());
+        Map<String, Map<String, Object>> result = new LinkedHashMap<>();
+        for (Long id : ids) {
+            deviceRepository.findById(id).ifPresent(device ->
+                result.put(String.valueOf(id), computeFeatures(device, id)));
+        }
+        return ResponseEntity.ok(ApiResponse.ok(Map.of("features", result)));
+    }
+
+    /** Compute feature status map for a device from existing data */
+    private Map<String, Object> computeFeatures(Device device, Long deviceId) {
+        Map<String, Object> f = new LinkedHashMap<>();
+
+        // ── Hardware / Network ──
+        f.put("gps",          device.getLat() != null && device.getLon() != null);
+        f.put("imei",         device.getImei() != null && !device.getImei().isEmpty());
+        f.put("networkInfo",  device.getPhone() != null || device.getIccid() != null);
+        f.put("battery",      device.getBatteryLevel() != null);
+        f.put("android",      device.getAndroidVersion() != null && !device.getAndroidVersion().isEmpty());
+
+        // ── Mode / Status ──
+        f.put("mdmMode",      Boolean.TRUE.equals(device.getMdmMode()));
+        f.put("kioskMode",    Boolean.TRUE.equals(device.getKioskMode()));
+        f.put("defaultLauncher", Boolean.TRUE.equals(device.getDefaultLauncher()));
+        f.put("configAssigned",  device.getConfigId() != null);
+
+        // ── Data sync ──
+        f.put("contacts",     contactRepository.countByDeviceId(deviceId) > 0);
+        f.put("callLogs",     callLogRepository.countByDeviceId(deviceId) > 0);
+        f.put("installedApps", !deviceApplicationRepository.findByDeviceId(deviceId).isEmpty());
+        f.put("locationHistory", locationRepository.countByDeviceId(deviceId) > 0);
+
+        // ── Online / Last sync ──
+        f.put("online",       "ONLINE".equals(device.getStatus()));
+        f.put("lastSync",     device.getLastSync() != null);
+        f.put("pushCapable",  pushMessageRepository.countByDeviceId(deviceId) > 0);
+
+        return f;
     }
 
     /** Dashboard stats */
