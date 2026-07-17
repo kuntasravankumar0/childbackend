@@ -35,6 +35,7 @@ public class AdminDeviceController {
     private final DeviceContactRepository       contactRepository;
     private final CallLogRepository             callLogRepository;
     private final DeviceNotificationRepository  notificationRepository;
+    private final GeofenceRepository            geofenceRepository;
 
     /** List devices with pagination + search */
     @GetMapping
@@ -94,6 +95,7 @@ public class AdminDeviceController {
         pushMessageRepository.deleteByDeviceId(id);
         logRepository.deleteByDeviceId(id);
         locationRepository.deleteByDeviceId(id);
+        geofenceRepository.deleteByDeviceId(id);
         deviceApplicationRepository.deleteByDeviceId(id);
         deviceRepository.deleteById(id);
         return ResponseEntity.ok(ApiResponse.ok());
