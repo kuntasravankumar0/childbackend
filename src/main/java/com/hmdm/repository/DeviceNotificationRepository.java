@@ -9,14 +9,20 @@ import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Optional;
 
 @Repository
 public interface DeviceNotificationRepository extends JpaRepository<DeviceNotification, Long> {
     List<DeviceNotification> findByDeviceIdOrderByReceivedAtDesc(Long deviceId);
     Page<DeviceNotification> findByDeviceIdOrderByReceivedAtDesc(Long deviceId, Pageable pageable);
     long countByDeviceId(Long deviceId);
+    Optional<DeviceNotification> findByIdAndDeviceId(Long id, Long deviceId);
 
     @Modifying
     @Transactional
     void deleteByDeviceId(Long deviceId);
+
+    @Modifying
+    @Transactional
+    void deleteByIdAndDeviceId(Long id, Long deviceId);
 }

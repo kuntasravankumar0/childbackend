@@ -44,7 +44,6 @@ public class AdminDataController {
         
         List<Map<String, Object>> allContacts = googleSheetsService.getContacts(deviceId);
         
-        // Paginate in-memory (1000+ contacts is manageable)
         int total = allContacts.size();
         int from = page * size;
         int to = Math.min(from + size, total);
@@ -79,9 +78,7 @@ public class AdminDataController {
             @RequestParam(required = false) Long dateTo) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
         
-        // Use paginated DB query for efficient 50K+ call log handling
         PageRequest pageRequest = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "callDate"));
-        
         Page<CallLog> callLogPage = callLogRepository.searchByDeviceId(
                 deviceId, search, type, dateFrom, dateTo, pageRequest);
         
@@ -176,19 +173,39 @@ public class AdminDataController {
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
+    /**
+     * Delete a SINGLE notification by ID.
+     * Admin can delete individual notifications without removing all others.
+     * Returns 404 if the notification doesn't exist or doesn't belong to this device.
+     */
+    @DeleteMapping("/notifications/{notifId}")
+    public ResponseEntity<ApiResponse<Void>> deleteNotification(
+            @PathVariable Long deviceId,
+            @PathVariable Long notifId) {
+        if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
+
+        // Check that the notification actually belongs to this device
+        var notif = notificationRepository.findByIdAndDeviceId(notifId, deviceId);
+        if (notif.isEmpty()) return ResponseEntity.notFound().build();
+
+        notificationRepository.deleteByIdAndDeviceId(notifId, deviceId);
+        log.info("Notification {} deleted for device {}", notifId, deviceId);
+        return ResponseEntity.ok(ApiResponse.ok());
+    }
+
     @DeleteMapping("/notifications")
     public ResponseEntity<ApiResponse<Void>> deleteNotifications(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
         notificationRepository.deleteByDeviceId(deviceId);
+        log.info("All notifications deleted for device {}", deviceId);
         return ResponseEntity.ok(ApiResponse.ok());
     }
 
-    // ─── Dashboard counts (from GoogleSheetsService — includes PostgreSQL fallback) ───
+    // ─── Dashboard counts ───
 
     @GetMapping("/counts")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getCounts(@PathVariable Long deviceId) {
         if (!deviceRepository.existsById(deviceId)) return ResponseEntity.notFound().build();
-        // GoogleSheetsService.getCounts() already handles PostgreSQL fallback
         Map<String, Object> counts = new LinkedHashMap<>();
         counts.putAll(googleSheetsService.getCounts(deviceId));
         return ResponseEntity.ok(ApiResponse.ok(counts));
