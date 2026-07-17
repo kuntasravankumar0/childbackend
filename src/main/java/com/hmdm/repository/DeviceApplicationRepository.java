@@ -15,6 +15,9 @@ import java.util.Optional;
 public interface DeviceApplicationRepository extends JpaRepository<DeviceApplication, Long> {
     List<DeviceApplication> findByDeviceId(Long deviceId);
     Optional<DeviceApplication> findByDeviceIdAndPkg(Long deviceId, String pkg);
+
+    @Modifying
+    @Transactional
     void deleteByDeviceId(Long deviceId);
 
     /**
