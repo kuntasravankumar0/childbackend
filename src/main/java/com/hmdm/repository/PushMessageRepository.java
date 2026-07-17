@@ -12,6 +12,7 @@ import java.util.List;
 public interface PushMessageRepository extends JpaRepository<PushMessage, Long> {
     List<PushMessage> findByDeviceIdAndSentFalseOrderByCreatedAtAsc(Long deviceId);
     List<PushMessage> findByDeviceIdOrderByCreatedAtDesc(Long deviceId);
+    long countByDeviceId(Long deviceId);
 
     @Modifying
     @Transactional
